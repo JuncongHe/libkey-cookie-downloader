@@ -36,7 +36,7 @@ lkfetch doctor --cookie-domain example.invalid --library-id example_library
 
 `doctor` also accepts the environment variables above; CLI options take precedence. It makes no LibKey network request and prints no URL, cookie names, values, headers, or profile paths. It reports dependency, configuration, configured/selected browser and profile names, and reader status with a fixed hint for cookie failures. For Dia, `Profile: configured=auto` means no profile was specified. Exit 0 means matching cookies were found, 1 means the dependency or reader is unavailable, access timed out or was denied, or there are no matching cookies, and 2 means a library ID or cookie domain is missing.
 
-Dia requires the installed `browser-cookie3` package and macOS `/usr/bin/security` to decrypt its local cookies. macOS may ask you to approve Keychain access; choose **Allow** to proceed. Denying access or leaving the prompt unanswered until it times out makes the command fail with a nonzero exit status. Run `doctor --browser dia` to check access without downloading a PDF.
+Dia requires the installed `browser-cookie3` package and macOS `/usr/bin/security` to decrypt its local cookies. Unlock the macOS Passwords app if it is locked; macOS may then ask you to approve Keychain access, where **Allow** is required. Denying access or leaving the prompt unanswered until it times out makes the command fail with a nonzero exit status. Run `doctor --browser dia` to check access without downloading a PDF.
 
 For a UTF-8 file with one DOI per line:
 

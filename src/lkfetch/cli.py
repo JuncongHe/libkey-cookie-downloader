@@ -14,7 +14,7 @@ from .download import DownloadError, chrome_cookie_loader, download_pdf, normali
 _ERROR_MESSAGES = {
     "invalid_input": "check the DOI, library ID, and cookie domain",
     "cookie_config": "check the browser setting or select a Dia profile with --profile",
-    "cookie_timeout": "Keychain request timed out; approve access and retry",
+    "cookie_timeout": "Keychain request timed out; unlock Passwords or approve access and retry",
     "cookie_denied": "Keychain access denied; allow access and retry",
     "cookie_error": "could not read browser cookies; check browser access",
     "non_pdf": "service returned a non-PDF response",

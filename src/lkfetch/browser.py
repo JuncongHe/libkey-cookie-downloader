@@ -64,7 +64,15 @@ def _dia_database(domain: str, profile: str | None) -> tuple[Path, str]:
 def _dia_password() -> bytearray:
     try:
         result = subprocess.run(
-            ["/usr/bin/security", "find-generic-password", "-w", "-s", "Dia Safe Storage"],
+            [
+                "/usr/bin/security",
+                "find-generic-password",
+                "-w",
+                "-a",
+                "Dia",
+                "-s",
+                "Dia Safe Storage",
+            ],
             timeout=10, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
     except subprocess.TimeoutExpired:

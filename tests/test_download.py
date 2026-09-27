@@ -393,6 +393,7 @@ class DownloadTest(unittest.TestCase):
                     self.assertEqual(result, exit_code, stdout.getvalue())
                 security.assert_called_once()
                 self.assertEqual(security.call_args.args[0][:2], ["/usr/bin/security", "find-generic-password"])
+                self.assertEqual(security.call_args.args[0][2:], ["-w", "-a", "Dia", "-s", "Dia Safe Storage"])
                 self.assertEqual(security.call_args.kwargs["timeout"], 10)
                 fetched.assert_not_called()
                 network.assert_not_called()

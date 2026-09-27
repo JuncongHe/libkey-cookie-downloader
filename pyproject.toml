@@ -1,0 +1,6 @@
+[project]
+name = "lkfetch"
+version = "0.0.0"
+description = "Unofficial LibKey helper skeleton"
+readme = "README.md"
+requires-python = ">=3.11"

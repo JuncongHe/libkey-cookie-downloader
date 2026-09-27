@@ -100,7 +100,7 @@ def _batch(args: argparse.Namespace) -> int:
                     failed += 1
                     hint = f": {_ERROR_MESSAGES[category]}" if category in _COOKIE_ERRORS else ""
                     print(f"DOI: {doi}\nPath: {target}\nStatus: failure ({category}{hint})")
-                    if category in {"rate_limited", "authentication_error"} | _COOKIE_ERRORS:
+                    if category == "rate_limited" or category in _COOKIE_ERRORS:
                         stopped = category
                         break
     except (OSError, UnicodeError):

@@ -1,6 +1,7 @@
 """Download one PDF using browser cookies kept in memory."""
 
 import hashlib
+from html.parser import HTMLParser
 import json
 import os
 import re
@@ -65,6 +66,129 @@ def valid_cookie_domain(value: str) -> bool:
     return re.fullmatch(r"\.?[A-Za-z0-9][A-Za-z0-9.-]*", value) is not None
 
 
+def _is_resolver_host(host: str) -> bool:
+    host = host.rstrip(".").lower()
+    return host == "resolve.thirdiron.com" or host == "libkey.io" or host.endswith(".libkey.io")
+
+
+def _libkey_resolver_url(url: str, token: str) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    if not _is_resolver_host(parsed.hostname or ""):
+        return url
+    query = [(key, value) for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True) if key != "access_token"]
+    query.append(("access_token", token))
+    return urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(query)))
+
+
+def _proxy_url(url: str, cookie_domain: str) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.hostname
+    if not host:
+        return url
+    proxy_host = f"{host.replace('.', '-')}.{cookie_domain.lstrip('.')}"
+    if parsed.port:
+        proxy_host = f"{proxy_host}:{parsed.port}"
+    return urllib.parse.urlunsplit(parsed._replace(netloc=proxy_host))
+
+
+def _valid_https_url(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    parsed = urllib.parse.urlsplit(value)
+    return (
+        parsed.scheme == "https"
+        and bool(parsed.hostname)
+        and not parsed.username
+        and not parsed.password
+        and not any(ord(char) < 32 for char in value)
+    )
+
+
+class _PDFLinkParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links = []
+
+    def handle_starttag(self, tag, attrs):
+        for name, value in attrs:
+            if name.lower() == "href" and value:
+                self.links.append(value)
+
+
+def _pdf_link_from_html(body: bytes, base_url: str, cookie_domain: str) -> str | None:
+    parser = _PDFLinkParser()
+    parser.feed(body.decode("utf-8", "replace"))
+    candidates = []
+    for href in parser.links:
+        candidate = urllib.parse.urljoin(base_url, href)
+        if not _valid_https_url(candidate):
+            continue
+        parsed = urllib.parse.urlsplit(candidate)
+        if ".pdf" not in parsed.path.lower():
+            continue
+        if not _is_proxy_host(parsed.hostname or "", cookie_domain):
+            candidate = _proxy_url(candidate, cookie_domain)
+        priority = 0 if ("full.pdf" in parsed.path.lower() or "full-text.pdf" in parsed.path.lower()) else 1
+        candidates.append((priority, candidate))
+    if not candidates:
+        return None
+    return min(candidates)[1]
+
+
+def _save_pdf_response(response, directory: Path, cookie_domain: str) -> tuple[Path | None, str | None]:
+    first = response.read(1024)
+    content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+    if not first.startswith(b"%PDF-") and content_type != "application/pdf":
+        if content_type != "text/html":
+            raise DownloadError("non_pdf", "server returned a non-PDF response")
+        body = first + response.read(max(0, 2_000_000 - len(first)))
+        return None, _pdf_link_from_html(body, response.geturl(), cookie_domain)
+    with tempfile.NamedTemporaryFile(dir=directory, prefix=".lkfetch-", suffix=".part", delete=False) as temp:
+        temp_path = Path(temp.name)
+        temp.write(first)
+        shutil.copyfileobj(response, temp)
+    return temp_path, None
+
+
+def _is_proxy_host(host: str, cookie_domain: str) -> bool:
+    host = host.lstrip(".").lower()
+    domain = cookie_domain.lstrip(".").lower()
+    return host == domain or host.endswith("." + domain)
+
+
+class _ProxyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, cookie_domain: str):
+        self.cookie_domain = cookie_domain.lstrip(".").lower()
+
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        source_host = urllib.parse.urlsplit(request.full_url).hostname or ""
+        target = urllib.parse.urlsplit(newurl)
+        if (
+            _is_resolver_host(source_host)
+            and target.scheme == "https"
+            and target.hostname
+        ):
+            login_host = f"login.{self.cookie_domain}"
+            if target.hostname.lower() == login_host and target.path == "/login":
+                values = urllib.parse.parse_qs(target.query).get("url", [])
+                if len(values) == 1:
+                    target_url = urllib.parse.urlsplit(values[0])
+                    if (
+                        target_url.scheme == "https"
+                        and target_url.hostname
+                        and not target_url.username
+                        and not target_url.password
+                    ):
+                        newurl = (
+                            values[0]
+                            if _is_proxy_host(target_url.hostname, self.cookie_domain)
+                            else _proxy_url(values[0], self.cookie_domain)
+                        )
+            elif not _is_proxy_host(target.hostname, self.cookie_domain):
+                newurl = _proxy_url(newurl, self.cookie_domain)
+        return super().redirect_request(request, fp, code, msg, headers, newurl)
+
+
 def download_pdf(
     doi: str,
     library_id: str,
@@ -99,11 +223,13 @@ def download_pdf(
     except Exception:
         raise DownloadError("cookie_error", "could not load browser cookies") from None
 
-    if opener_factory is None:
-        opener_factory = urllib.request.build_opener
     temp_path = None
     try:
-        opener = opener_factory(urllib.request.HTTPCookieProcessor(cookies))
+        cookie_processor = urllib.request.HTTPCookieProcessor(cookies)
+        if opener_factory is None:
+            opener = urllib.request.build_opener(cookie_processor, _ProxyRedirectHandler(cookie_domain))
+        else:
+            opener = opener_factory(cookie_processor)
         token_request = urllib.request.Request(
             "https://api.thirdiron.com/v2/api-tokens",
             data=json.dumps({"libraryId": library_id, "returnPreproxy": True, "client": "bzweb"}).encode(),
@@ -124,28 +250,36 @@ def download_pdf(
         )
         try:
             with opener.open(article_request, timeout=60) as response:
-                pdf_url = json.load(response)["data"]["attributes"].get("fullTextFile")
+                attributes = json.load(response)["data"]["attributes"]
+                pdf_url = attributes.get("fullTextFile")
         except (ValueError, KeyError, TypeError, AttributeError):
             raise DownloadError("non_pdf", "service did not provide a PDF URL") from None
         try:
             if not isinstance(pdf_url, str):
                 raise ValueError
-            parsed_url = urllib.parse.urlsplit(pdf_url)
-            if parsed_url.scheme != "https" or not parsed_url.hostname or parsed_url.username or parsed_url.password or any(ord(char) < 32 for char in pdf_url):
+            if not _valid_https_url(pdf_url):
                 raise ValueError
-            pdf_request = urllib.request.Request(pdf_url, headers={"Authorization": f"Bearer {token}"})
+            pdf_request = urllib.request.Request(_libkey_resolver_url(pdf_url, token))
         except (TypeError, ValueError):
             raise DownloadError("non_pdf", "service did not provide a PDF URL")
 
-        with opener.open(pdf_request, timeout=60) as response:
-            first = response.read(1024)
-            content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-            if not first.startswith(b"%PDF-") and content_type != "application/pdf":
-                raise DownloadError("non_pdf", "server returned a non-PDF response")
-            with tempfile.NamedTemporaryFile(dir=directory, prefix=".lkfetch-", suffix=".part", delete=False) as temp:
-                temp_path = Path(temp.name)
-                temp.write(first)
-                shutil.copyfileobj(response, temp)
+        candidates = [pdf_request.full_url]
+        permalink = attributes.get("permalink")
+        if _valid_https_url(permalink):
+            permalink_host = urllib.parse.urlsplit(permalink).hostname or ""
+            candidates.append(permalink if _is_proxy_host(permalink_host, cookie_domain) else _proxy_url(permalink, cookie_domain))
+        for _ in range(3):
+            if not candidates:
+                break
+            candidate = candidates.pop(0)
+            with opener.open(urllib.request.Request(candidate), timeout=60) as response:
+                temp_path, linked_pdf = _save_pdf_response(response, directory, cookie_domain)
+            if temp_path is not None:
+                break
+            if linked_pdf is not None:
+                candidates.insert(0, linked_pdf)
+        if temp_path is None:
+            raise DownloadError("non_pdf", "server returned a non-PDF response")
 
         try:
             os.link(temp_path, target)

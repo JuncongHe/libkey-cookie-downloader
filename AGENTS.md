@@ -19,8 +19,10 @@ Chrome is the default. For Dia, use `--browser dia` and, when needed,
 authenticated session rather than assuming the CLI default. If Dia reports a
 Keychain timeout or denial, ask the user to unlock Passwords or approve access,
 then retry. Do not bypass MFA, CAPTCHA, access-denied pages, publisher
-restrictions, or rate limits; stop on repeated authentication failures or HTTP
-429.
+restrictions, or rate limits. Batch is sequential and should continue after a
+per-DOI failure, including `authentication_error` from an HTTP 401/403 and
+`non_pdf`; stop only for HTTP 429 (`rate_limited`) or browser cookie,
+Keychain, and configuration failures.
 
 Only report the DOI, output path, and status returned by `lkfetch`. Do not
 expose browser internals or session material in logs, prompts, or commits.

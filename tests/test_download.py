@@ -8,6 +8,7 @@ import tempfile
 import types
 import unittest
 import urllib.error
+import urllib.parse
 from contextlib import closing, redirect_stderr, redirect_stdout
 from http.cookiejar import CookieJar
 from pathlib import Path
@@ -18,13 +19,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from lkfetch.cli import main
 from lkfetch import browser as browser_module
 from lkfetch.browser import BrowserError
-from lkfetch.download import DownloadError, download_pdf, normalize_doi, target_for
+from lkfetch.download import DownloadError, _ProxyRedirectHandler, download_pdf, normalize_doi, target_for
 
 
 class FakeResponse(io.BytesIO):
-    def __init__(self, body, content_type="application/octet-stream"):
+    def __init__(self, body, content_type="application/octet-stream", url="https://files.example.invalid/article.pdf"):
         super().__init__(body)
         self.headers = {"Content-Type": content_type}
+        self.url = url
+
+    def geturl(self):
+        return self.url
 
 
 class DownloadTest(unittest.TestCase):
@@ -82,9 +87,98 @@ class DownloadTest(unittest.TestCase):
         self.assertEqual(article_request.full_url, "https://api.thirdiron.com/v2/articles/doi%3A10.1234%2FExample?include=issue,journal")
         self.assertEqual(article_request.get_header("Authorization"), "Bearer test-token")
         self.assertEqual(pdf_request.full_url, self.pdf_url)
-        self.assertEqual(pdf_request.get_header("Authorization"), "Bearer test-token")
+        self.assertIsNone(pdf_request.get_header("Authorization"))
         linked.assert_called_once()
         self.assertEqual(list(self.directory.iterdir()), [target])
+
+    def test_libkey_resolver_gets_query_token_without_bearer_header(self):
+        self.pdf_url = (
+            "https://libkey.io/libraries/1726/articles/123/full-text-file"
+            "?utm_source=test&access_token=stale-token"
+        )
+        self.article_response = {"data": {"attributes": {"fullTextFile": self.pdf_url}}}
+        target, status = self.fetch()
+        self.assertEqual(status, "downloaded")
+        pdf_request = [call[1] for call in self.calls if call[0] == "open"][2]
+        parsed = urllib.parse.urlsplit(pdf_request.full_url)
+        self.assertEqual(parsed.netloc, "libkey.io")
+        self.assertEqual(
+            urllib.parse.parse_qs(parsed.query),
+            {"utm_source": ["test"], "access_token": ["test-token"]},
+        )
+        self.assertIsNone(pdf_request.get_header("Authorization"))
+        self.assertEqual(target.read_bytes(), b"%PDF-1.7\nexample")
+
+    def test_third_iron_resolver_gets_query_token_without_bearer_header(self):
+        self.pdf_url = (
+            "https://resolve.thirdiron.com/v2/libraries/1726/articles/123/fullTextFile"
+            "?access_token=stale-token"
+        )
+        self.article_response = {"data": {"attributes": {"fullTextFile": self.pdf_url}}}
+        target, status = self.fetch("10.1234/resolve")
+        self.assertEqual(status, "downloaded")
+        pdf_request = [call[1] for call in self.calls if call[0] == "open"][2]
+        parsed = urllib.parse.urlsplit(pdf_request.full_url)
+        self.assertEqual(parsed.netloc, "resolve.thirdiron.com")
+        self.assertEqual(urllib.parse.parse_qs(parsed.query), {"access_token": ["test-token"]})
+        self.assertIsNone(pdf_request.get_header("Authorization"))
+        self.assertEqual(target.read_bytes(), b"%PDF-1.7\nexample")
+
+    def test_html_full_text_falls_back_to_publisher_pdf_link(self):
+        self.pdf_url = "https://resolve.thirdiron.com/v2/libraries/1726/articles/123/fullTextFile"
+        self.article_response = {
+            "data": {"attributes": {
+                "fullTextFile": self.pdf_url,
+                "permalink": "https://publisher.example.invalid/lookup/doi/10.1234/example",
+            }},
+        }
+
+        def response(request, timeout):
+            if "/lookup/doi/" in request.full_url:
+                return FakeResponse(
+                    b'<html><a href="/content/article.full.pdf">PDF</a></html>',
+                    "text/html", request.full_url,
+                )
+            if request.full_url.endswith("/content/article.full.pdf"):
+                return FakeResponse(b"%PDF-1.7\nfallback", url=request.full_url)
+            return FakeResponse(b"<html>not a PDF</html>", "text/html", request.full_url)
+
+        self.pdf_response = response
+        target, status = self.fetch("10.1234/fallback")
+        self.assertEqual(status, "downloaded")
+        self.assertEqual(target.read_bytes(), b"%PDF-1.7\nfallback")
+
+    def test_resolver_redirect_enters_configured_proxy(self):
+        source = urllib.request.Request("https://resolve.thirdiron.com/v2/fullTextFile")
+        target = "https://journals.example.edu/doi/pdf/10.1234/example"
+        redirected = _ProxyRedirectHandler("proxy.example.edu").redirect_request(
+            source, None, 302, "Found", {"Location": target}, target,
+        )
+        self.assertEqual(
+            redirected.full_url,
+            "https://journals-example-edu.proxy.example.edu/doi/pdf/10.1234/example",
+        )
+
+    def test_non_resolver_redirect_is_not_rewritten(self):
+        source = urllib.request.Request("https://files.example.invalid/article.pdf")
+        target = "https://cdn.example.invalid/article.pdf"
+        redirected = _ProxyRedirectHandler("proxy.example.edu").redirect_request(
+            source, None, 302, "Found", {"Location": target}, target,
+        )
+        self.assertEqual(redirected.full_url, target)
+
+    def test_resolver_login_redirect_unwraps_to_configured_proxy(self):
+        source = urllib.request.Request("https://resolve.thirdiron.com/v2/fullTextFile")
+        target = "https://login.proxy.example.edu/login?" + urllib.parse.urlencode({
+            "url": "https://journals.example.edu/doi/pdf/10.1234/example",
+        })
+        redirected = _ProxyRedirectHandler("proxy.example.edu").redirect_request(
+            source, None, 302, "Found", {"Location": target}, target,
+        )
+        self.assertEqual(
+            redirected.full_url,
+            "https://journals-example-edu.proxy.example.edu/doi/pdf/10.1234/example",
+        )
 
     def test_content_type_can_identify_pdf(self):
         self.pdf_response = lambda request, timeout: FakeResponse(b"binary", "application/pdf; charset=binary")
@@ -587,27 +681,47 @@ class DownloadTest(unittest.TestCase):
         self.assertIn("Status: skipped_existing", stdout.getvalue())
         self.assertIn("Summary: downloaded=1 skipped_existing=1 failed=2", stdout.getvalue())
 
-    def test_batch_continues_ordinary_errors_then_stops_on_auth_or_rate_limit(self):
+    def test_batch_continues_per_doi_errors_including_authentication(self):
         source = self.directory / "dois.txt"
         source.write_text("".join(f"10.1234/item{i}\n" for i in range(5)), encoding="utf-8")
-        for stop_category in ("rate_limited", "authentication_error"):
-            with self.subTest(stop_category=stop_category):
-                stdout = io.StringIO()
-                errors = [DownloadError(category, "https://secret.example/sso") for category in
-                          ("non_pdf", "http_error", "network_error", stop_category)]
-                with (
-                    mock.patch.dict(os.environ, {"LKFETCH_LIBRARY_ID": "lib", "LKFETCH_COOKIE_DOMAIN": "example.invalid"}, clear=True),
-                    mock.patch("lkfetch.cli.download_pdf", side_effect=errors) as fetched,
-                    mock.patch("lkfetch.cli.time.sleep") as sleep,
-                    redirect_stdout(stdout),
-                ):
-                    self.assertEqual(main(["batch", str(source)]), 1)
-                self.assertEqual(fetched.call_count, 4)
-                self.assertEqual(sleep.call_args_list, [mock.call(3.0)] * 3)
-                self.assertNotIn("item4", stdout.getvalue())
-                self.assertNotIn("secret.example", stdout.getvalue())
-                self.assertIn(f"failure ({stop_category})", stdout.getvalue())
-                self.assertIn(f"Summary: downloaded=0 skipped_existing=0 failed=4 stopped={stop_category}", stdout.getvalue())
+        stdout = io.StringIO()
+        errors = [DownloadError(category, "https://secret.example/sso") for category in
+                  ("non_pdf", "http_error", "network_error", "authentication_error")]
+        fifth = (target_for("10.1234/item4", self.directory / "pdfs"), "downloaded")
+        with (
+            mock.patch.dict(os.environ, {"LKFETCH_LIBRARY_ID": "lib", "LKFETCH_COOKIE_DOMAIN": "example.invalid"}, clear=True),
+            mock.patch("lkfetch.cli.download_pdf", side_effect=errors + [fifth]) as fetched,
+            mock.patch("lkfetch.cli.time.sleep") as sleep,
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(main(["batch", str(source)]), 1)
+        self.assertEqual(fetched.call_count, 5)
+        self.assertEqual(sleep.call_args_list, [mock.call(3.0)] * 4)
+        self.assertIn("item4", stdout.getvalue())
+        self.assertNotIn("secret.example", stdout.getvalue())
+        self.assertIn("failure (authentication_error)", stdout.getvalue())
+        self.assertIn("Status: downloaded", stdout.getvalue())
+        self.assertIn("Summary: downloaded=1 skipped_existing=0 failed=4", stdout.getvalue())
+
+    def test_batch_stops_on_rate_limit(self):
+        source = self.directory / "dois.txt"
+        source.write_text("".join(f"10.1234/item{i}\n" for i in range(3)), encoding="utf-8")
+        stdout = io.StringIO()
+        errors = [
+            DownloadError("rate_limited", "https://secret.example/sso"),
+            (target_for("10.1234/item1", self.directory / "pdfs"), "downloaded"),
+        ]
+        with (
+            mock.patch.dict(os.environ, {"LKFETCH_LIBRARY_ID": "lib", "LKFETCH_COOKIE_DOMAIN": "example.invalid"}, clear=True),
+            mock.patch("lkfetch.cli.download_pdf", side_effect=errors) as fetched,
+            mock.patch("lkfetch.cli.time.sleep") as sleep,
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(main(["batch", str(source)]), 1)
+        self.assertEqual(fetched.call_count, 1)
+        sleep.assert_not_called()
+        self.assertNotIn("item1", stdout.getvalue())
+        self.assertIn("Summary: downloaded=0 skipped_existing=0 failed=1 stopped=rate_limited", stdout.getvalue())
 
     def test_batch_stops_immediately_on_cookie_access_failure(self):
         source = self.directory / "dois.txt"

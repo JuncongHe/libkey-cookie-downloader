@@ -49,6 +49,22 @@ Check the session before asking the agent to download:
 lkfetch doctor
 ```
 
+`LKFETCH_COOKIE_DOMAIN` must be the domain that carries the authenticated
+library/proxy session. It is usually an EZproxy or institutional proxy domain,
+not `libkey.io`, which identifies the LibKey site or affiliation. Do not guess
+the browser or domain after a failed check; run `doctor` with the browser and
+profile that actually contain the logged-in session.
+
+For the verified Rutgers/Dia setup used during development:
+
+```sh
+lkfetch doctor \
+  --library-id 1726 \
+  --cookie-domain proxy.libraries.rutgers.edu \
+  --browser dia \
+  --profile 'Profile 2'
+```
+
 For Dia on macOS, unlock Passwords and approve the Keychain prompt if macOS
 asks. The agent should ask the user to do this through the normal browser and
 macOS UI; it must not request or print the secret itself.
@@ -74,7 +90,9 @@ Use this skill when a user asks to retrieve a licensed paper PDF by DOI.
 4. Report only the DOI, output path, status, and sanitized error category.
 5. Never request, print, save, inspect, or return browser cookies, tokens,
    credentials, browser databases, or profile files.
-6. If authentication, Keychain, MFA, CAPTCHA, access-denied, or rate-limit
+6. Do not silently change browser, profile, or cookie domain after a failed
+   `doctor`; ask the user to confirm the browser session and proxy domain.
+7. If authentication, Keychain, MFA, CAPTCHA, access-denied, or rate-limit
    handling is required, stop and ask the user to use the normal browser flow.
 ```
 

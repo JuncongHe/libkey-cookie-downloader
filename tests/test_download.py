@@ -177,6 +177,74 @@ class DownloadTest(unittest.TestCase):
         self.assertIn("download_error", stderr.getvalue())
         self.assertNotIn("secret.example", stderr.getvalue())
 
+    def test_batch_reads_utf8_in_order_without_echoing_invalid_lines(self):
+        source = self.directory / "dois.txt"
+        source.write_text(
+            "  \n\t # comment\n doi:10.1234/first \n"
+            "https://secret.example/sso?token=PRIVATE\n"
+            "10.1234/trailing\t\n10.1234/second\n",
+            encoding="utf-8",
+        )
+        output = self.directory / "pdfs"
+        first = target_for("10.1234/first", output)
+        second = target_for("10.1234/second", output)
+        stdout = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {"LKFETCH_LIBRARY_ID": "env", "LKFETCH_COOKIE_DOMAIN": "env.invalid"}, clear=True),
+            mock.patch("lkfetch.cli.download_pdf", side_effect=[(first, "downloaded"), (second, "skipped_existing")]) as fetched,
+            mock.patch("lkfetch.cli.time.sleep") as sleep,
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(main(["batch", str(source), "--library-id", "cli", "--cookie-domain", "cli.invalid", "--output-dir", str(output), "--delay", "0"]), 1)
+        self.assertEqual(fetched.call_args_list, [
+            mock.call("10.1234/first", "cli", "cli.invalid", str(output)),
+            mock.call("10.1234/second", "cli", "cli.invalid", str(output)),
+        ])
+        sleep.assert_called_once_with(0.0)
+        self.assertLess(stdout.getvalue().index("DOI: 10.1234/first"), stdout.getvalue().index("DOI: 10.1234/second"))
+        self.assertEqual(stdout.getvalue().count("failure (invalid_input)"), 2)
+        self.assertNotIn("secret.example", stdout.getvalue())
+        self.assertNotIn("PRIVATE", stdout.getvalue())
+        self.assertIn("Status: skipped_existing", stdout.getvalue())
+        self.assertIn("Summary: downloaded=1 skipped_existing=1 failed=2", stdout.getvalue())
+
+    def test_batch_continues_ordinary_errors_then_stops_on_auth_or_rate_limit(self):
+        source = self.directory / "dois.txt"
+        source.write_text("".join(f"10.1234/item{i}\n" for i in range(5)), encoding="utf-8")
+        for stop_category in ("rate_limited", "authentication_error"):
+            with self.subTest(stop_category=stop_category):
+                stdout = io.StringIO()
+                errors = [DownloadError(category, "https://secret.example/sso") for category in
+                          ("non_pdf", "http_error", "network_error", stop_category)]
+                with (
+                    mock.patch.dict(os.environ, {"LKFETCH_LIBRARY_ID": "lib", "LKFETCH_COOKIE_DOMAIN": "example.invalid"}, clear=True),
+                    mock.patch("lkfetch.cli.download_pdf", side_effect=errors) as fetched,
+                    mock.patch("lkfetch.cli.time.sleep") as sleep,
+                    redirect_stdout(stdout),
+                ):
+                    self.assertEqual(main(["batch", str(source)]), 1)
+                self.assertEqual(fetched.call_count, 4)
+                self.assertEqual(sleep.call_args_list, [mock.call(3.0)] * 3)
+                self.assertNotIn("item4", stdout.getvalue())
+                self.assertNotIn("secret.example", stdout.getvalue())
+                self.assertIn(f"failure ({stop_category})", stdout.getvalue())
+                self.assertIn(f"Summary: downloaded=0 skipped_existing=0 failed=4 stopped={stop_category}", stdout.getvalue())
+
+    def test_batch_missing_config_and_invalid_delay(self):
+        source = self.directory / "dois.txt"
+        source.write_text("10.1234/example\n", encoding="utf-8")
+        for environment, missing in (({}, "LKFETCH_LIBRARY_ID"), ({"LKFETCH_LIBRARY_ID": "lib"}, "LKFETCH_COOKIE_DOMAIN")):
+            with self.subTest(missing=missing):
+                stderr = io.StringIO()
+                with mock.patch.dict(os.environ, environment, clear=True), mock.patch("lkfetch.cli.download_pdf") as fetched, redirect_stderr(stderr):
+                    self.assertEqual(main(["batch", str(source)]), 2)
+                self.assertIn(missing, stderr.getvalue())
+                fetched.assert_not_called()
+        for delay in ("-1", "nan", "inf"):
+            with self.subTest(delay=delay), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+                main(["batch", str(source), "--delay", delay])
+            self.assertEqual(caught.exception.code, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

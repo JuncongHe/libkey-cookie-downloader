@@ -1,6 +1,7 @@
 """Download one PDF using browser cookies kept in memory."""
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -89,10 +90,6 @@ def download_pdf(
     if target.exists():
         return target, "skipped_existing"
 
-    url = (
-        f"https://libkey.io/libraries/{library_id}/pdfexpress/openurl?"
-        f"{urllib.parse.urlencode({'doi': doi, 'sid': 'lkfetch'})}"
-    )
     try:
         cookies, _ = load_browser_cookies(
             cookie_domain, browser=browser, profile=profile, cookie_loader=cookie_loader,
@@ -107,7 +104,40 @@ def download_pdf(
     temp_path = None
     try:
         opener = opener_factory(urllib.request.HTTPCookieProcessor(cookies))
-        with opener.open(url, timeout=60) as response:
+        token_request = urllib.request.Request(
+            "https://api.thirdiron.com/v2/api-tokens",
+            data=json.dumps({"libraryId": library_id, "returnPreproxy": True, "client": "bzweb"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with opener.open(token_request, timeout=60) as response:
+                token = json.load(response)["api-tokens"][0]["id"]
+            if not isinstance(token, str) or not token or any(ord(char) < 32 for char in token):
+                raise ValueError
+        except (ValueError, KeyError, IndexError, TypeError):
+            raise DownloadError("authentication_error", "browser session was not authorized") from None
+
+        article_request = urllib.request.Request(
+            f"https://api.thirdiron.com/v2/articles/{urllib.parse.quote('doi:' + doi, safe='')}?include=issue,journal",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        try:
+            with opener.open(article_request, timeout=60) as response:
+                pdf_url = json.load(response)["data"]["attributes"].get("fullTextFile")
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise DownloadError("non_pdf", "service did not provide a PDF URL") from None
+        try:
+            if not isinstance(pdf_url, str):
+                raise ValueError
+            parsed_url = urllib.parse.urlsplit(pdf_url)
+            if parsed_url.scheme != "https" or not parsed_url.hostname or parsed_url.username or parsed_url.password or any(ord(char) < 32 for char in pdf_url):
+                raise ValueError
+            pdf_request = urllib.request.Request(pdf_url, headers={"Authorization": f"Bearer {token}"})
+        except (TypeError, ValueError):
+            raise DownloadError("non_pdf", "service did not provide a PDF URL")
+
+        with opener.open(pdf_request, timeout=60) as response:
             first = response.read(1024)
             content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
             if not first.startswith(b"%PDF-") and content_type != "application/pdf":

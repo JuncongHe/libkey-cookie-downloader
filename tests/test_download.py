@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import sqlite3
 import subprocess
@@ -33,6 +34,10 @@ class DownloadTest(unittest.TestCase):
         self.directory = Path(self.temporary.name)
         self.cookies = CookieJar()
         self.calls = []
+        self.pdf_url = "https://files.example.invalid/article.pdf"
+        self.token_response = {"api-tokens": [{"id": "test-token"}]}
+        self.article_response = {"data": {"attributes": {"fullTextFile": self.pdf_url}}}
+        self.pdf_response = lambda request, timeout: FakeResponse(b"%PDF-1.7\nexample")
 
     def loader(self, **kwargs):
         self.calls.append(("cookies", kwargs))
@@ -42,9 +47,13 @@ class DownloadTest(unittest.TestCase):
         self.assertIs(handler.cookiejar, self.cookies)
         return self
 
-    def open(self, url, timeout):
-        self.calls.append(("open", url, timeout))
-        return FakeResponse(b"%PDF-1.7\nexample")
+    def open(self, request, timeout):
+        self.calls.append(("open", request, timeout))
+        if request.full_url.endswith("/api-tokens"):
+            return FakeResponse(json.dumps(self.token_response).encode(), "application/json")
+        if "/v2/articles/" in request.full_url:
+            return FakeResponse(json.dumps(self.article_response).encode(), "application/json")
+        return self.pdf_response(request, timeout)
 
     def fetch(self, doi="10.1234/example", library_id="lib_1"):
         return download_pdf(
@@ -52,7 +61,7 @@ class DownloadTest(unittest.TestCase):
             cookie_loader=self.loader, opener_factory=self.factory,
         )
 
-    def test_url_cookie_scope_and_atomic_pdf(self):
+    def test_token_article_url_cookie_scope_and_atomic_pdf(self):
         link = os.link
         def check_link(source, destination):
             self.assertEqual(Path(source).read_bytes(), b"%PDF-1.7\nexample")
@@ -64,25 +73,73 @@ class DownloadTest(unittest.TestCase):
         self.assertEqual(target.read_bytes(), b"%PDF-1.7\nexample")
         self.assertEqual(target.parent, self.directory)
         self.assertEqual(self.calls[0], ("cookies", {"domain_name": "example.invalid"}))
-        self.assertEqual(
-            self.calls[1],
-            ("open", "https://libkey.io/libraries/lib_1/pdfexpress/openurl?doi=10.1234%2FExample&sid=lkfetch", 60),
-        )
+        token_request, article_request, pdf_request = [call[1] for call in self.calls[1:]]
+        self.assertEqual([call[2] for call in self.calls[1:]], [60, 60, 60])
+        self.assertEqual(token_request.full_url, "https://api.thirdiron.com/v2/api-tokens")
+        self.assertEqual(token_request.get_method(), "POST")
+        self.assertEqual(json.loads(token_request.data), {"libraryId": "lib_1", "returnPreproxy": True, "client": "bzweb"})
+        self.assertEqual(token_request.get_header("Content-type"), "application/json")
+        self.assertEqual(article_request.full_url, "https://api.thirdiron.com/v2/articles/doi%3A10.1234%2FExample?include=issue,journal")
+        self.assertEqual(article_request.get_header("Authorization"), "Bearer test-token")
+        self.assertEqual(pdf_request.full_url, self.pdf_url)
+        self.assertEqual(pdf_request.get_header("Authorization"), "Bearer test-token")
         linked.assert_called_once()
         self.assertEqual(list(self.directory.iterdir()), [target])
 
     def test_content_type_can_identify_pdf(self):
-        self.open = lambda url, timeout: FakeResponse(b"binary", "application/pdf; charset=binary")
+        self.pdf_response = lambda request, timeout: FakeResponse(b"binary", "application/pdf; charset=binary")
         target, status = self.fetch()
         self.assertEqual(status, "downloaded")
         self.assertEqual(target.read_bytes(), b"binary")
 
     def test_html_rejected_without_target_or_temp(self):
-        self.open = lambda url, timeout: FakeResponse(b"<html>sign in</html>", "text/html")
+        self.pdf_response = lambda request, timeout: FakeResponse(b"<html>sign in</html>", "text/html")
         with self.assertRaises(DownloadError) as caught:
             self.fetch()
         self.assertEqual(caught.exception.category, "non_pdf")
         self.assertEqual(list(self.directory.iterdir()), [])
+
+    def test_missing_or_invalid_full_text_file_is_non_pdf(self):
+        for value in (None, 42, "http://files.example.invalid/article.pdf", "https://", "https://[bad", "https://user:pass@files.example.invalid/article.pdf"):
+            with self.subTest(value=value):
+                self.article_response = {"data": {"attributes": {"fullTextFile": value}}}
+                with self.assertRaises(DownloadError) as caught:
+                    self.fetch()
+                self.assertEqual(caught.exception.category, "non_pdf")
+                self.assertEqual(len(self.calls), 3)
+                self.assertEqual(list(self.directory.iterdir()), [])
+                self.calls.clear()
+
+    def test_missing_token_is_authentication_error(self):
+        self.token_response = {"api-tokens": []}
+        with self.assertRaises(DownloadError) as caught:
+            self.fetch()
+        self.assertEqual(caught.exception.category, "authentication_error")
+        self.assertEqual(len(self.calls), 2)
+
+    def test_malformed_utf8_api_responses_are_sanitized(self):
+        for stage, category, message, request_count in (
+            ("api-tokens", "authentication_error", "browser session was not authorized", 1),
+            ("/v2/articles/", "non_pdf", "service did not provide a PDF URL", 2),
+        ):
+            with self.subTest(stage=stage):
+                requested = []
+
+                def open_response(request, timeout):
+                    requested.append(request.full_url)
+                    if stage in request.full_url:
+                        return FakeResponse(b"\xffSECRET_BODY", "application/json")
+                    return DownloadTest.open(self, request, timeout)
+
+                self.open = open_response
+                with self.assertRaises(DownloadError) as caught:
+                    self.fetch()
+                self.assertEqual(caught.exception.category, category)
+                self.assertEqual(str(caught.exception), message)
+                self.assertNotIn("SECRET_BODY", str(caught.exception))
+                self.assertEqual(len(requested), request_count)
+                self.assertEqual(list(self.directory.iterdir()), [])
+                self.calls.clear()
 
     def test_failed_link_leaves_no_target_or_temp(self):
         with mock.patch("lkfetch.download.os.link", side_effect=OSError("disk full")):
@@ -113,11 +170,11 @@ class DownloadTest(unittest.TestCase):
         self.assertEqual(self.calls, [])
         target.unlink()
 
-        def race(url, timeout):
+        def race(request, timeout):
             target.write_bytes(b"other process")
             return FakeResponse(b"%PDF-1.7\nnew")
 
-        self.open = race
+        self.pdf_response = race
         self.assertEqual(self.fetch(), (target, "skipped_existing"))
         self.assertEqual(target.read_bytes(), b"other process")
         self.assertEqual(list(self.directory.iterdir()), [target])
@@ -133,19 +190,23 @@ class DownloadTest(unittest.TestCase):
             download_pdf("10.1234/example", "lib_1", ".", self.directory, cookie_loader=self.loader)
 
     def test_http_errors_are_sanitized(self):
-        for code, category in ((401, "authentication_error"), (403, "authentication_error"), (429, "rate_limited")):
-            with self.subTest(code=code):
-                error = urllib.error.HTTPError("https://secret.example/sso", code, "secret", {}, None)
+        for stage in ("api-tokens", "articles", "article.pdf"):
+            for code, category in ((401, "authentication_error"), (403, "authentication_error"), (429, "rate_limited"), (500, "http_error")):
+                with self.subTest(stage=stage, code=code):
+                    original_open = DownloadTest.open.__get__(self)
 
-                def fail(url, timeout):
-                    raise error
+                    def fail(request, timeout):
+                        if stage in request.full_url:
+                            raise urllib.error.HTTPError("https://secret.example/sso?token=PRIVATE", code, "secret", {}, None)
+                        return original_open(request, timeout)
 
-                self.open = fail
-                with self.assertRaises(DownloadError) as caught:
-                    self.fetch()
-                error.close()
-                self.assertEqual(caught.exception.category, category)
-                self.assertNotIn("secret", str(caught.exception))
+                    self.open = fail
+                    with self.assertRaises(DownloadError) as caught:
+                        self.fetch()
+                    self.assertEqual(caught.exception.category, category)
+                    self.assertNotIn("secret", str(caught.exception))
+                    self.assertNotIn("PRIVATE", str(caught.exception))
+                    self.calls.clear()
         self.assertEqual(list(self.directory.iterdir()), [])
 
     def test_network_error_is_sanitized(self):

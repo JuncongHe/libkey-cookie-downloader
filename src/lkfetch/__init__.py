@@ -1,1 +1,1 @@
-"""Unofficial LibKey helper skeleton."""
+"""Unofficial single-DOI LibKey PDF downloader."""

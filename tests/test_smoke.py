@@ -13,4 +13,4 @@ class SmokeTest(unittest.TestCase):
             text=True,
             check=True,
         )
-        self.assertIn("Downloads are not implemented yet", result.stdout)
+        self.assertIn("download", result.stdout)

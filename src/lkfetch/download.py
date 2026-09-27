@@ -1,0 +1,127 @@
+"""Download one PDF using Chrome cookies kept in memory."""
+
+import hashlib
+import os
+import re
+import shutil
+import tempfile
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+
+class DownloadError(Exception):
+    def __init__(self, category: str, message: str):
+        self.category = category
+        super().__init__(message)
+
+
+def normalize_doi(value: str) -> str:
+    if any(unicodedata.category(char).startswith("C") for char in value):
+        raise DownloadError("invalid_input", "DOI contains control characters")
+    doi = value.strip()
+    doi = re.sub(
+        r"(?i)^(?:doi:\s*|https?://(?:www\.)?doi\.org/|(?:www\.)?doi\.org/)",
+        "",
+        doi,
+    ).strip()
+    decoded = urllib.parse.unquote(doi)
+    if (
+        len(doi) > 2048
+        or not re.fullmatch(r"10\.\d{4,9}/\S+", doi)
+        or any(char.isspace() or unicodedata.category(char).startswith("C") for char in decoded)
+        or any(char in doi for char in "\\?#")
+        or "\\" in decoded
+        or any(part in {".", ".."} for part in decoded.split("/"))
+    ):
+        raise DownloadError("invalid_input", "enter a valid DOI")
+    return doi
+
+
+def target_for(doi: str, output_dir: str | Path) -> Path:
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", doi).strip("-")[:80]
+    digest = hashlib.sha256(doi.encode()).hexdigest()[:12]
+    return Path(output_dir) / f"{slug}-{digest}.pdf"
+
+
+def download_pdf(
+    doi: str,
+    library_id: str,
+    cookie_domain: str,
+    output_dir: str | Path = ".",
+    *,
+    cookie_loader=None,
+    opener_factory=None,
+) -> tuple[Path, str]:
+    doi = normalize_doi(doi)
+    library_id = library_id.strip()
+    cookie_domain = cookie_domain.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", library_id):
+        raise DownloadError("invalid_input", "library ID must use letters, numbers, _ or -")
+    if not re.fullmatch(r"\.?[A-Za-z0-9][A-Za-z0-9.-]*", cookie_domain):
+        raise DownloadError("invalid_input", "enter a valid cookie domain")
+
+    directory = Path(output_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    target = target_for(doi, directory)
+    if target.exists():
+        return target, "skipped_existing"
+
+    url = (
+        f"https://libkey.io/libraries/{library_id}/pdfexpress/openurl?"
+        f"{urllib.parse.urlencode({'doi': doi, 'sid': 'lkfetch'})}"
+    )
+    try:
+        if cookie_loader is None:
+            from browser_cookie3 import chrome
+
+            cookie_loader = chrome
+        cookies = cookie_loader(domain_name=cookie_domain)
+    except Exception:
+        raise DownloadError("cookie_error", "could not load Chrome cookies") from None
+
+    if opener_factory is None:
+        opener_factory = urllib.request.build_opener
+    temp_path = None
+    try:
+        opener = opener_factory(urllib.request.HTTPCookieProcessor(cookies))
+        with opener.open(url, timeout=60) as response:
+            first = response.read(1024)
+            content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if not first.startswith(b"%PDF-") and content_type != "application/pdf":
+                raise DownloadError("non_pdf", "server returned a non-PDF response")
+            with tempfile.NamedTemporaryFile(dir=directory, prefix=".lkfetch-", suffix=".part", delete=False) as temp:
+                temp_path = Path(temp.name)
+                temp.write(first)
+                shutil.copyfileobj(response, temp)
+
+        try:
+            os.link(temp_path, target)
+        except FileExistsError:
+            return target, "skipped_existing"
+        except OSError:
+            raise DownloadError("file_error", "could not save PDF") from None
+        try:
+            if not target.samefile(temp_path):
+                raise DownloadError("file_error", "target changed during download")
+            temp_path.unlink()
+        except DownloadError:
+            raise
+        except OSError:
+            raise DownloadError("file_error", "could not save PDF") from None
+        temp_path = None
+        return target, "downloaded"
+    except urllib.error.HTTPError as error:
+        error.close()
+        if error.code in (401, 403):
+            raise DownloadError("authentication_error", "Chrome session was not authorized") from None
+        if error.code == 429:
+            raise DownloadError("rate_limited", "server asked to slow down") from None
+        raise DownloadError("http_error", "server could not provide the PDF") from None
+    except OSError:
+        raise DownloadError("network_error", "could not reach the PDF service") from None
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)

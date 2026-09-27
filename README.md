@@ -18,6 +18,14 @@ lkfetch download '10.1234/example' --output-dir ./pdfs
 
 `python -m lkfetch download ...` works too. The command resolves one DOI through `https://libkey.io`, follows normal redirects, waits up to 60 seconds, and saves only responses identified as PDFs. Existing files are skipped. It reports an authentication error for 401/403 and a rate-limit error for 429. Use it only for content your account is licensed to access, and respect provider rate limits.
 
+Check configuration and Chrome cookie access first:
+
+```sh
+lkfetch doctor --cookie-domain example.invalid --library-id example_library
+```
+
+`doctor` also accepts the environment variables above; CLI options take precedence. It makes no LibKey network request and prints no URL, cookie names, values, headers, or profile paths. It reports dependency, configuration, and Chrome reader status only. Exit 0 means matching cookies were found, 1 means the dependency or reader is unavailable or there are no matching cookies, and 2 means a library ID or cookie domain is missing.
+
 For a UTF-8 file with one DOI per line:
 
 ```sh

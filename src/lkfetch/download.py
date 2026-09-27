@@ -46,6 +46,22 @@ def target_for(doi: str, output_dir: str | Path) -> Path:
     return Path(output_dir) / f"{slug}-{digest}.pdf"
 
 
+def chrome_cookie_loader():
+    from browser_cookie3 import chrome
+
+    return chrome
+
+
+def load_chrome_cookies(cookie_domain: str, *, cookie_loader=None):
+    if cookie_loader is None:
+        cookie_loader = chrome_cookie_loader()
+    return cookie_loader(domain_name=cookie_domain)
+
+
+def valid_cookie_domain(value: str) -> bool:
+    return re.fullmatch(r"\.?[A-Za-z0-9][A-Za-z0-9.-]*", value) is not None
+
+
 def download_pdf(
     doi: str,
     library_id: str,
@@ -60,7 +76,7 @@ def download_pdf(
     cookie_domain = cookie_domain.strip()
     if not re.fullmatch(r"[A-Za-z0-9_-]+", library_id):
         raise DownloadError("invalid_input", "library ID must use letters, numbers, _ or -")
-    if not re.fullmatch(r"\.?[A-Za-z0-9][A-Za-z0-9.-]*", cookie_domain):
+    if not valid_cookie_domain(cookie_domain):
         raise DownloadError("invalid_input", "enter a valid cookie domain")
 
     directory = Path(output_dir)
@@ -74,11 +90,7 @@ def download_pdf(
         f"{urllib.parse.urlencode({'doi': doi, 'sid': 'lkfetch'})}"
     )
     try:
-        if cookie_loader is None:
-            from browser_cookie3 import chrome
-
-            cookie_loader = chrome
-        cookies = cookie_loader(domain_name=cookie_domain)
+        cookies = load_chrome_cookies(cookie_domain, cookie_loader=cookie_loader)
     except Exception:
         raise DownloadError("cookie_error", "could not load Chrome cookies") from None
 

@@ -2,6 +2,7 @@ import io
 import os
 import sys
 import tempfile
+import types
 import unittest
 import urllib.error
 from contextlib import redirect_stderr, redirect_stdout
@@ -176,6 +177,88 @@ class DownloadTest(unittest.TestCase):
             self.assertEqual(main(["download", "10.1234/example", "--library-id", "lib_1", "--cookie-domain", "example.invalid"]), 1)
         self.assertIn("download_error", stderr.getvalue())
         self.assertNotIn("secret.example", stderr.getvalue())
+
+    def test_doctor_ready_scopes_chrome_and_redacts_values(self):
+        chrome = mock.Mock(return_value=["SECRET_COOKIE=SECRET_VALUE"])
+        browser_cookie3 = types.ModuleType("browser_cookie3")
+        browser_cookie3.chrome = chrome
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {"LKFETCH_LIBRARY_ID": "env-secret", "LKFETCH_COOKIE_DOMAIN": "env-secret.invalid"}, clear=True),
+            mock.patch.dict(sys.modules, {"browser_cookie3": browser_cookie3}),
+            mock.patch("lkfetch.cli.download_pdf") as fetched,
+            mock.patch("lkfetch.download.urllib.request.build_opener") as network,
+            redirect_stdout(stdout), redirect_stderr(stderr),
+        ):
+            self.assertEqual(main(["doctor", "--cookie-domain", "cli-secret.invalid", "--library-id", "cli-secret"]), 0)
+        chrome.assert_called_once_with(domain_name="cli-secret.invalid")
+        fetched.assert_not_called()
+        network.assert_not_called()
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(stdout.getvalue().splitlines(), [
+            "Dependency: ready", "library_id: configured", "cookie_domain: configured", "Chrome cookie reader: ready",
+        ])
+
+    def test_doctor_empty_jar_and_loader_error(self):
+        browser_cookie3 = types.ModuleType("browser_cookie3")
+        for cookies, expected in ((CookieJar(), "no matching cookies"), (OSError("/secret/profile Cookie=PRIVATE https://secret.example"), "error")):
+            with self.subTest(expected=expected):
+                chrome = mock.Mock(side_effect=cookies) if isinstance(cookies, Exception) else mock.Mock(return_value=cookies)
+                browser_cookie3.chrome = chrome
+                stdout = io.StringIO()
+                with (
+                    mock.patch.dict(os.environ, {}, clear=True),
+                    mock.patch.dict(sys.modules, {"browser_cookie3": browser_cookie3}),
+                    redirect_stdout(stdout),
+                ):
+                    self.assertEqual(main(["doctor", "--library-id", "lib", "--cookie-domain", "example.invalid"]), 1)
+                chrome.assert_called_once_with(domain_name="example.invalid")
+                self.assertIn(f"Chrome cookie reader: {expected}", stdout.getvalue())
+                self.assertNotIn("secret", stdout.getvalue())
+                self.assertNotIn("PRIVATE", stdout.getvalue())
+                self.assertNotIn("/", stdout.getvalue())
+
+    def test_doctor_missing_config_and_dependency(self):
+        browser_cookie3 = types.ModuleType("browser_cookie3")
+        browser_cookie3.chrome = mock.Mock(return_value=[object()])
+        for args, environment, missing in (
+            (["doctor", "--cookie-domain", "example.invalid"], {}, "library_id"),
+            (["doctor", "--library-id", "lib"], {}, "cookie_domain"),
+            (["doctor", "--library-id", "lib", "--cookie-domain", " "], {"LKFETCH_COOKIE_DOMAIN": "env.invalid"}, "cookie_domain"),
+        ):
+            with self.subTest(missing=missing, args=args):
+                stdout = io.StringIO()
+                with (
+                    mock.patch.dict(os.environ, environment, clear=True),
+                    mock.patch.dict(sys.modules, {"browser_cookie3": browser_cookie3}),
+                    redirect_stdout(stdout),
+                ):
+                    self.assertEqual(main(args), 2)
+                self.assertIn(f"{missing}: missing", stdout.getvalue())
+                self.assertIn("Chrome cookie reader: error", stdout.getvalue())
+                browser_cookie3.chrome.assert_not_called()
+
+        stdout = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.dict(sys.modules, {"browser_cookie3": None}),
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(main(["doctor", "--library-id", "lib", "--cookie-domain", "example.invalid"]), 1)
+        self.assertIn("Dependency: missing", stdout.getvalue())
+        self.assertIn("Chrome cookie reader: error", stdout.getvalue())
+
+        stdout = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.dict(sys.modules, {"browser_cookie3": browser_cookie3}),
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(main(["doctor", "--library-id", "lib", "--cookie-domain", "%"]), 1)
+        browser_cookie3.chrome.assert_not_called()
+        self.assertIn("cookie_domain: configured", stdout.getvalue())
+        self.assertIn("Chrome cookie reader: error", stdout.getvalue())
 
     def test_batch_reads_utf8_in_order_without_echoing_invalid_lines(self):
         source = self.directory / "dois.txt"

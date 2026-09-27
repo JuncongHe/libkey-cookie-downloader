@@ -19,12 +19,12 @@ lkfetch download '10.1234/example' --output-dir ./pdfs
 Chrome is the default. To use Dia, select it and optionally name a Dia profile:
 
 ```sh
-lkfetch doctor --browser dia --profile "Profile 2"
-lkfetch download '10.1234/example' --browser dia --profile "Profile 2" --output-dir ./pdfs
-lkfetch batch dois.txt --browser dia --profile "Profile 2" --output-dir ./pdfs
+lkfetch doctor --browser dia --profile "Profile 1"
+lkfetch download '10.1234/example' --browser dia --profile "Profile 1" --output-dir ./pdfs
+lkfetch batch dois.txt --browser dia --profile "Profile 1" --output-dir ./pdfs
 ```
 
-All three commands accept `--browser chrome|dia` and `--profile NAME`. The environment equivalents are `LKFETCH_BROWSER` and `LKFETCH_BROWSER_PROFILE`; command-line values override them. Dia accepts `Default` or `Profile N`. Without `--profile`, Dia selects the unique profile with cookies for the requested domain; if several match, specify one with `--profile`. Chrome profile selection is unsupported, so omit `--profile` with Chrome. The library ID and cookie domain are still required through options or environment variables.
+All three commands accept `--browser chrome|dia` and `--profile NAME`. The environment equivalents are `LKFETCH_BROWSER` and `LKFETCH_BROWSER_PROFILE`; command-line values override them. Dia accepts `Default` or `Profile N`; replace the example profile with the exact local profile that contains the authenticated session. Without `--profile`, Dia selects the unique profile with cookies for the requested domain; if several match, specify one with `--profile`. Chrome profile selection is unsupported, so omit `--profile` with Chrome. The library ID and authenticated cookie domain are user- and institution-specific; provide them through options or environment variables rather than committing them.
 
 `python -m lkfetch download ...` works too. The command uses the selected browser session to request a temporary LibKey API token, resolves the DOI through the Third Iron articles API, and downloads its `fullTextFile` URL. Each request waits up to 60 seconds; only responses identified as PDFs are saved. Existing files are skipped. It reports an authentication error for 401/403 and a rate-limit error for 429. Use it only for content your account is licensed to access, and respect provider rate limits.
 
@@ -46,6 +46,6 @@ lkfetch batch dois.txt --library-id example_library --cookie-domain example.inva
 
 Blank lines and lines whose first non-whitespace character is `#` are ignored. CLI options override environment variables as in `download`. Batch processes one DOI at a time in file order, waiting 3 seconds by default between valid DOI attempts; `--delay` accepts finite non-negative seconds (`0` is useful for tests). It skips existing PDFs, continues after invalid input and ordinary download errors, and stops after a rate limit, 401/403 authentication error, cookie access timeout or denial, cookie read error, or invalid/ambiguous profile selection. Item output contains only normalized DOI, target path, status, and error category (plus a fixed hint for cookie failures); invalid lines are never echoed. The summary counts downloaded, skipped, and failed items and states the stop reason when stopped early. Batch exits nonzero if any item fails.
 
-Cookies are read from the selected browser for the specified domain and kept in memory in this process; they are not written to disk or printed. The temporary API token also stays in memory. The downloaded PDF is written through a temporary file in the output directory, which must support hard links. Manifests, MCP support, concurrency, and retry are unimplemented. The current implementation has been verified with a live Dia browser session; provider and institution behavior can still vary by DOI.
+Cookies are read from the selected browser for the specified domain and kept in memory in this process; they are not written to disk or printed. The temporary API token also stays in memory. The downloaded PDF is written through a temporary file in the output directory, which must support hard links. Manifests, MCP support, concurrency, and retry are unimplemented. The current implementation has been verified with a live supported browser session; provider and institution behavior can still vary by DOI.
 
 For agent and Codex Skill installation and usage, see [docs/agent-skill.md](docs/agent-skill.md). The repository also includes project-scoped [AGENTS.md](AGENTS.md) instructions.

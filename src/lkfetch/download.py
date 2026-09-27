@@ -1,4 +1,4 @@
-"""Download one PDF using Chrome cookies kept in memory."""
+"""Download one PDF using browser cookies kept in memory."""
 
 import hashlib
 import os
@@ -10,6 +10,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+from .browser import BrowserError, load_browser_cookies
 
 
 class DownloadError(Exception):
@@ -68,6 +70,8 @@ def download_pdf(
     cookie_domain: str,
     output_dir: str | Path = ".",
     *,
+    browser: str = "chrome",
+    profile: str | None = None,
     cookie_loader=None,
     opener_factory=None,
 ) -> tuple[Path, str]:
@@ -90,9 +94,13 @@ def download_pdf(
         f"{urllib.parse.urlencode({'doi': doi, 'sid': 'lkfetch'})}"
     )
     try:
-        cookies = load_chrome_cookies(cookie_domain, cookie_loader=cookie_loader)
+        cookies, _ = load_browser_cookies(
+            cookie_domain, browser=browser, profile=profile, cookie_loader=cookie_loader,
+        )
+    except BrowserError as error:
+        raise DownloadError(error.category, error.message) from None
     except Exception:
-        raise DownloadError("cookie_error", "could not load Chrome cookies") from None
+        raise DownloadError("cookie_error", "could not load browser cookies") from None
 
     if opener_factory is None:
         opener_factory = urllib.request.build_opener
@@ -128,7 +136,7 @@ def download_pdf(
     except urllib.error.HTTPError as error:
         error.close()
         if error.code in (401, 403):
-            raise DownloadError("authentication_error", "Chrome session was not authorized") from None
+            raise DownloadError("authentication_error", "browser session was not authorized") from None
         if error.code == 429:
             raise DownloadError("rate_limited", "server asked to slow down") from None
         raise DownloadError("http_error", "server could not provide the PDF") from None

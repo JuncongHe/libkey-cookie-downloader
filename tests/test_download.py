@@ -1,11 +1,13 @@
 import io
 import os
+import sqlite3
+import subprocess
 import sys
 import tempfile
 import types
 import unittest
 import urllib.error
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import closing, redirect_stderr, redirect_stdout
 from http.cookiejar import CookieJar
 from pathlib import Path
 from unittest import mock
@@ -13,6 +15,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from lkfetch.cli import main
+from lkfetch import browser as browser_module
+from lkfetch.browser import BrowserError
 from lkfetch.download import DownloadError, download_pdf, normalize_doi, target_for
 
 
@@ -169,7 +173,7 @@ class DownloadTest(unittest.TestCase):
         stdout = io.StringIO()
         with mock.patch.dict(os.environ, {"LKFETCH_LIBRARY_ID": "from_env", "LKFETCH_COOKIE_DOMAIN": "env.invalid"}, clear=True), mock.patch("lkfetch.cli.download_pdf", return_value=(self.directory / "test.pdf", "downloaded")) as mocked, redirect_stdout(stdout):
             self.assertEqual(main(["download", "10.1234/example", "--library-id", "from_cli", "--cookie-domain", "cli.invalid"]), 0)
-        mocked.assert_called_once_with("10.1234/example", "from_cli", "cli.invalid", ".")
+        mocked.assert_called_once_with("10.1234/example", "from_cli", "cli.invalid", ".", browser="chrome", profile=None)
         self.assertIn("Status: downloaded", stdout.getvalue())
 
         stderr = io.StringIO()
@@ -178,50 +182,278 @@ class DownloadTest(unittest.TestCase):
         self.assertIn("download_error", stderr.getvalue())
         self.assertNotIn("secret.example", stderr.getvalue())
 
+    def test_browser_environment_and_cli_precedence(self):
+        base = {"LKFETCH_LIBRARY_ID": "lib", "LKFETCH_COOKIE_DOMAIN": "example.invalid"}
+        for environment, options, browser, profile in (
+            ({**base, "LKFETCH_BROWSER": "dia", "LKFETCH_BROWSER_PROFILE": "Profile 2"}, [], "dia", "Profile 2"),
+            ({**base, "LKFETCH_BROWSER": "chrome", "LKFETCH_BROWSER_PROFILE": "Default"}, ["--browser", "dia", "--profile", "Profile 2"], "dia", "Profile 2"),
+        ):
+            with self.subTest(options=options):
+                with (
+                    mock.patch.dict(os.environ, environment, clear=True),
+                    mock.patch("lkfetch.cli.download_pdf", return_value=(self.directory / "test.pdf", "downloaded")) as fetched,
+                    redirect_stdout(io.StringIO()),
+                ):
+                    self.assertEqual(main(["download", "10.1234/example", *options]), 0)
+                fetched.assert_called_once_with("10.1234/example", "lib", "example.invalid", ".", browser=browser, profile=profile)
+
+    def test_download_error_output_redacts_browser_details(self):
+        for category, expected in (
+            ("cookie_denied", "Keychain access denied; allow access and retry"),
+            ("cookie_config", "select a Dia profile with --profile"),
+        ):
+            with self.subTest(category=category):
+                stderr = io.StringIO()
+                with (
+                    mock.patch.dict(os.environ, {"LKFETCH_LIBRARY_ID": "lib", "LKFETCH_COOKIE_DOMAIN": "example.invalid"}, clear=True),
+                    mock.patch("lkfetch.cli.download_pdf", side_effect=DownloadError(category, "/private/secret Cookie=PRIVATE")),
+                    redirect_stderr(stderr),
+                ):
+                    self.assertEqual(main(["download", "10.1234/example", "--browser", "dia"]), 1)
+                self.assertIn(f"failure ({category}:", stderr.getvalue())
+                self.assertIn(expected, stderr.getvalue())
+                self.assertNotIn("/private", stderr.getvalue())
+                self.assertNotIn("PRIVATE", stderr.getvalue())
+
     def test_doctor_ready_scopes_chrome_and_redacts_values(self):
-        chrome = mock.Mock(return_value=["SECRET_COOKIE=SECRET_VALUE"])
-        browser_cookie3 = types.ModuleType("browser_cookie3")
-        browser_cookie3.chrome = chrome
         stdout = io.StringIO()
         stderr = io.StringIO()
         with (
             mock.patch.dict(os.environ, {"LKFETCH_LIBRARY_ID": "env-secret", "LKFETCH_COOKIE_DOMAIN": "env-secret.invalid"}, clear=True),
-            mock.patch.dict(sys.modules, {"browser_cookie3": browser_cookie3}),
+            mock.patch("lkfetch.cli.chrome_cookie_loader", return_value=object()),
+            mock.patch("lkfetch.cli.load_browser_cookies", return_value=(["SECRET_COOKIE=SECRET_VALUE"], "Default")) as loaded,
             mock.patch("lkfetch.cli.download_pdf") as fetched,
             mock.patch("lkfetch.download.urllib.request.build_opener") as network,
             redirect_stdout(stdout), redirect_stderr(stderr),
         ):
             self.assertEqual(main(["doctor", "--cookie-domain", "cli-secret.invalid", "--library-id", "cli-secret"]), 0)
-        chrome.assert_called_once_with(domain_name="cli-secret.invalid")
+        loaded.assert_called_once_with("cli-secret.invalid", browser="chrome", profile=None)
         fetched.assert_not_called()
         network.assert_not_called()
         self.assertEqual(stderr.getvalue(), "")
         self.assertEqual(stdout.getvalue().splitlines(), [
-            "Dependency: ready", "library_id: configured", "cookie_domain: configured", "Chrome cookie reader: ready",
+            "Dependency: ready", "library_id: configured", "cookie_domain: configured",
+            "Browser: configured=chrome selected=chrome", "Profile: configured=default selected=Default",
+            "Chrome cookie reader: ready",
         ])
 
     def test_doctor_empty_jar_and_loader_error(self):
-        browser_cookie3 = types.ModuleType("browser_cookie3")
         for cookies, expected in ((CookieJar(), "no matching cookies"), (OSError("/secret/profile Cookie=PRIVATE https://secret.example"), "error")):
             with self.subTest(expected=expected):
-                chrome = mock.Mock(side_effect=cookies) if isinstance(cookies, Exception) else mock.Mock(return_value=cookies)
-                browser_cookie3.chrome = chrome
                 stdout = io.StringIO()
                 with (
                     mock.patch.dict(os.environ, {}, clear=True),
-                    mock.patch.dict(sys.modules, {"browser_cookie3": browser_cookie3}),
+                    mock.patch("lkfetch.cli.chrome_cookie_loader", return_value=object()),
+                    mock.patch("lkfetch.cli.load_browser_cookies", side_effect=cookies) if isinstance(cookies, Exception) else mock.patch("lkfetch.cli.load_browser_cookies", return_value=(cookies, "Default")) as loaded,
                     redirect_stdout(stdout),
                 ):
                     self.assertEqual(main(["doctor", "--library-id", "lib", "--cookie-domain", "example.invalid"]), 1)
-                chrome.assert_called_once_with(domain_name="example.invalid")
+                loaded.assert_called_once_with("example.invalid", browser="chrome", profile=None)
                 self.assertIn(f"Chrome cookie reader: {expected}", stdout.getvalue())
                 self.assertNotIn("secret", stdout.getvalue())
                 self.assertNotIn("PRIVATE", stdout.getvalue())
                 self.assertNotIn("/", stdout.getvalue())
 
+    def test_doctor_dia_reports_only_profile_names_without_network(self):
+        stdout = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {
+                "LKFETCH_LIBRARY_ID": "lib", "LKFETCH_COOKIE_DOMAIN": "example.invalid",
+                "LKFETCH_BROWSER": "chrome", "LKFETCH_BROWSER_PROFILE": "/private/env-secret",
+            }, clear=True),
+            mock.patch("lkfetch.cli.chrome_cookie_loader", return_value=object()),
+            mock.patch("lkfetch.cli.os.path.isfile", return_value=True),
+            mock.patch("lkfetch.cli.os.access", return_value=True) as security,
+            mock.patch("lkfetch.cli.load_browser_cookies", return_value=([object()], "Profile 2")) as loaded,
+            mock.patch("lkfetch.cli.download_pdf") as fetched,
+            mock.patch("lkfetch.download.urllib.request.build_opener") as network,
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(main(["doctor", "--browser", "dia", "--profile", "Profile 2"]), 0)
+        security.assert_called_once_with("/usr/bin/security", os.X_OK)
+        loaded.assert_called_once_with("example.invalid", browser="dia", profile="Profile 2")
+        fetched.assert_not_called()
+        network.assert_not_called()
+        self.assertIn("Browser: configured=dia selected=dia", stdout.getvalue())
+        self.assertIn("Profile: configured=Profile 2 selected=Profile 2", stdout.getvalue())
+        self.assertIn("Dia cookie reader: ready", stdout.getvalue())
+        self.assertNotIn("/private", stdout.getvalue())
+        self.assertNotIn("profile-secret", stdout.getvalue())
+
+    def test_doctor_dia_invalid_profile_values_are_not_echoed(self):
+        stdout = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {
+                "LKFETCH_LIBRARY_ID": "lib", "LKFETCH_COOKIE_DOMAIN": "example.invalid",
+                "LKFETCH_BROWSER": "dia", "LKFETCH_BROWSER_PROFILE": "/private/secret/Profile 2",
+            }, clear=True),
+            mock.patch("lkfetch.cli.chrome_cookie_loader", return_value=object()),
+            mock.patch("lkfetch.cli.os.path.isfile", return_value=True),
+            mock.patch("lkfetch.cli.os.access", return_value=True),
+            mock.patch("lkfetch.cli.load_browser_cookies", return_value=([object()], "/private/secret/Profile 2")),
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(main(["doctor"]), 0)
+        self.assertIn("Profile: configured=invalid selected=invalid", stdout.getvalue())
+        self.assertNotIn("Profile 2", stdout.getvalue())
+        self.assertNotIn("/private", stdout.getvalue())
+
+    def test_doctor_dia_requires_package_and_exact_security_binary(self):
+        for loader, exists, executable in ((ImportError("missing"), True, True), (object(), False, True), (object(), True, False)):
+            with self.subTest(loader=type(loader).__name__, exists=exists, executable=executable):
+                stdout = io.StringIO()
+                with (
+                    mock.patch.dict(os.environ, {}, clear=True),
+                    mock.patch("lkfetch.cli.chrome_cookie_loader", side_effect=loader) if isinstance(loader, Exception) else mock.patch("lkfetch.cli.chrome_cookie_loader", return_value=loader),
+                    mock.patch("lkfetch.cli.os.path.isfile", return_value=exists),
+                    mock.patch("lkfetch.cli.os.access", return_value=executable),
+                    mock.patch("lkfetch.cli.load_browser_cookies") as loaded,
+                    redirect_stdout(stdout),
+                ):
+                    self.assertEqual(main(["doctor", "--browser", "dia", "--library-id", "lib", "--cookie-domain", "example.invalid"]), 1)
+                self.assertIn("Dependency: missing", stdout.getvalue())
+                loaded.assert_not_called()
+
+    def test_doctor_dia_reader_failure_is_finite_and_redacted(self):
+        for failure in (TimeoutError("/private/secret Cookie=PRIVATE"), PermissionError("/private/secret Cookie=PRIVATE")):
+            with self.subTest(failure=type(failure).__name__):
+                stdout = io.StringIO()
+                with (
+                    mock.patch.dict(os.environ, {}, clear=True),
+                    mock.patch("lkfetch.cli.chrome_cookie_loader", return_value=object()),
+                    mock.patch("lkfetch.cli.os.path.isfile", return_value=True),
+                    mock.patch("lkfetch.cli.os.access", return_value=True),
+                    mock.patch("lkfetch.cli.load_browser_cookies", side_effect=failure),
+                    redirect_stdout(stdout),
+                ):
+                    self.assertEqual(main(["doctor", "--browser", "dia", "--library-id", "lib", "--cookie-domain", "example.invalid"]), 1)
+                self.assertIn("Dia cookie reader: error", stdout.getvalue())
+                self.assertNotIn("/private", stdout.getvalue())
+                self.assertNotIn("PRIVATE", stdout.getvalue())
+
+    def test_doctor_dia_ambiguous_profile_has_fixed_hint(self):
+        stdout = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("lkfetch.cli.chrome_cookie_loader", return_value=object()),
+            mock.patch("lkfetch.cli.os.path.isfile", return_value=True),
+            mock.patch("lkfetch.cli.os.access", return_value=True),
+            mock.patch("lkfetch.cli.load_browser_cookies", side_effect=BrowserError("cookie_config", "/private/secret Cookie=PRIVATE")),
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(main(["doctor", "--browser", "dia", "--library-id", "lib", "--cookie-domain", "example.invalid"]), 1)
+        self.assertIn("Profile: configured=auto selected=none", stdout.getvalue())
+        self.assertIn("Dia cookie reader: cookie_config:", stdout.getvalue())
+        self.assertIn("--profile", stdout.getvalue())
+        self.assertNotIn("PRIVATE", stdout.getvalue())
+        self.assertNotIn("/private", stdout.getvalue())
+
+    def test_doctor_dia_temp_sqlite_and_fake_keychain(self):
+        database = self.directory / "Library/Application Support/Dia/User Data/Default/Network/Cookies"
+        database.parent.mkdir(parents=True)
+        with closing(sqlite3.connect(database)) as connection:
+            connection.execute("CREATE TABLE cookies (host_key TEXT)")
+            connection.executemany("INSERT INTO cookies VALUES (?)", [(".sub.example.invalid",), ("evil-example.invalid",)])
+            connection.commit()
+
+        def fake_reader(path, domain):
+            self.assertEqual(path, database)
+            self.assertEqual(domain, "example.invalid")
+            password = browser_module._dia_password()
+            self.assertEqual(password, bytearray(b"fake-key"))
+            password[:] = b"\x00" * len(password)
+            return [object()]
+
+        outcomes = (
+            (subprocess.CompletedProcess([], 0, stdout=b"fake-key\n", stderr=b""), 0, "ready"),
+            (subprocess.TimeoutExpired("security", 10), 1, "cookie_timeout"),
+            (subprocess.CompletedProcess([], 1, stdout=b"", stderr=b"User denied Cookie=PRIVATE /private/secret"), 1, "cookie_denied"),
+            (subprocess.CompletedProcess([], 1, stdout=b"", stderr=b"opaque failure"), 1, "cookie_denied"),
+            (subprocess.CompletedProcess([], 0, stdout=b"", stderr=b""), 1, "cookie_error"),
+        )
+        open_readonly = browser_module._readonly_connection
+        for outcome, exit_code, reader in outcomes:
+            with self.subTest(reader=reader):
+                stdout = io.StringIO()
+                with (
+                    mock.patch.dict(os.environ, {}, clear=True),
+                    mock.patch("lkfetch.browser.Path.home", return_value=self.directory),
+                    mock.patch("lkfetch.browser._readonly_connection", side_effect=lambda path: closing(open_readonly(path))),
+                    mock.patch("lkfetch.browser._load_dia", side_effect=fake_reader) as loaded,
+                    mock.patch("lkfetch.browser.subprocess.run", side_effect=[outcome]) as security,
+                    mock.patch("lkfetch.cli.chrome_cookie_loader", return_value=object()),
+                    mock.patch("lkfetch.cli.os.path.isfile", return_value=True),
+                    mock.patch("lkfetch.cli.os.access", return_value=True),
+                    mock.patch("lkfetch.cli.download_pdf") as fetched,
+                    mock.patch("lkfetch.download.urllib.request.build_opener") as network,
+                    redirect_stdout(stdout),
+                ):
+                    result = main(["doctor", "--browser", "dia", "--library-id", "lib", "--cookie-domain", "example.invalid"])
+                    loaded.assert_called_once()
+                    self.assertEqual(result, exit_code, stdout.getvalue())
+                security.assert_called_once()
+                self.assertEqual(security.call_args.args[0][:2], ["/usr/bin/security", "find-generic-password"])
+                self.assertEqual(security.call_args.kwargs["timeout"], 10)
+                fetched.assert_not_called()
+                network.assert_not_called()
+                self.assertIn(f"Dia cookie reader: {reader}", stdout.getvalue())
+                self.assertNotIn(str(self.directory), stdout.getvalue())
+                self.assertNotIn("fake-key", stdout.getvalue())
+                self.assertNotIn("PRIVATE", stdout.getvalue())
+                if exit_code == 0:
+                    self.assertIn("Profile: configured=auto selected=Default", stdout.getvalue())
+                elif reader == "cookie_timeout":
+                    self.assertIn("approve access and retry", stdout.getvalue())
+                elif reader == "cookie_denied":
+                    self.assertIn("allow access and retry", stdout.getvalue())
+                elif reader == "cookie_error":
+                    self.assertIn("check browser access", stdout.getvalue())
+
+    def test_dia_reader_uses_inherited_load_without_constructor_or_db_copy(self):
+        database = self.directory / "Cookies"
+        with closing(sqlite3.connect(database)) as connection:
+            connection.execute("CREATE TABLE cookies (host_key TEXT)")
+            connection.execute("INSERT INTO cookies VALUES ('example.invalid')")
+            connection.commit()
+
+        fake = types.ModuleType("browser_cookie3")
+        calls = []
+        captured = {}
+
+        def derive(password, salt, length, rounds):
+            self.assertEqual((bytes(password), salt, length, rounds), (b"fake-key", b"saltysalt", 16, 1003))
+            captured["password"] = password
+            return b"derived"
+
+        class ChromiumBased:
+            def __init__(self):
+                raise AssertionError("constructor must not run")
+
+            def load(reader):
+                calls.append("load")
+                self.assertEqual(reader.cookie_file, database)
+                self.assertEqual(reader.v10_key, b"derived")
+                self.assertIs(fake._DatabaseConnetion, browser_module._ReadOnlyConnection)
+                with fake._DatabaseConnetion(reader.cookie_file) as connection:
+                    self.assertEqual(connection.execute("SELECT host_key FROM cookies").fetchone(), ("example.invalid",))
+                return CookieJar()
+
+        fake.PBKDF2 = derive
+        fake.ChromiumBased = ChromiumBased
+        original_connection = object()
+        fake._DatabaseConnetion = original_connection
+        with (
+            mock.patch.dict(sys.modules, {"browser_cookie3": fake}),
+            mock.patch("lkfetch.browser.subprocess.run", return_value=subprocess.CompletedProcess([], 0, stdout=b"fake-key\n", stderr=b"")) as security,
+        ):
+            cookies = browser_module._load_dia(database, "example.invalid")
+        self.assertEqual(len(cookies), 0)
+        self.assertEqual(calls, ["load"])
+        self.assertIs(fake._DatabaseConnetion, original_connection)
+        self.assertEqual(captured["password"], bytearray())
+        security.assert_called_once()
+
     def test_doctor_missing_config_and_dependency(self):
-        browser_cookie3 = types.ModuleType("browser_cookie3")
-        browser_cookie3.chrome = mock.Mock(return_value=[object()])
         for args, environment, missing in (
             (["doctor", "--cookie-domain", "example.invalid"], {}, "library_id"),
             (["doctor", "--library-id", "lib"], {}, "cookie_domain"),
@@ -231,18 +463,19 @@ class DownloadTest(unittest.TestCase):
                 stdout = io.StringIO()
                 with (
                     mock.patch.dict(os.environ, environment, clear=True),
-                    mock.patch.dict(sys.modules, {"browser_cookie3": browser_cookie3}),
+                    mock.patch("lkfetch.cli.chrome_cookie_loader", return_value=object()),
+                    mock.patch("lkfetch.cli.load_browser_cookies") as loaded,
                     redirect_stdout(stdout),
                 ):
                     self.assertEqual(main(args), 2)
                 self.assertIn(f"{missing}: missing", stdout.getvalue())
                 self.assertIn("Chrome cookie reader: error", stdout.getvalue())
-                browser_cookie3.chrome.assert_not_called()
+                loaded.assert_not_called()
 
         stdout = io.StringIO()
         with (
             mock.patch.dict(os.environ, {}, clear=True),
-            mock.patch.dict(sys.modules, {"browser_cookie3": None}),
+            mock.patch("lkfetch.cli.chrome_cookie_loader", side_effect=ImportError),
             redirect_stdout(stdout),
         ):
             self.assertEqual(main(["doctor", "--library-id", "lib", "--cookie-domain", "example.invalid"]), 1)
@@ -252,11 +485,12 @@ class DownloadTest(unittest.TestCase):
         stdout = io.StringIO()
         with (
             mock.patch.dict(os.environ, {}, clear=True),
-            mock.patch.dict(sys.modules, {"browser_cookie3": browser_cookie3}),
+            mock.patch("lkfetch.cli.chrome_cookie_loader", return_value=object()),
+            mock.patch("lkfetch.cli.load_browser_cookies") as loaded,
             redirect_stdout(stdout),
         ):
             self.assertEqual(main(["doctor", "--library-id", "lib", "--cookie-domain", "%"]), 1)
-        browser_cookie3.chrome.assert_not_called()
+        loaded.assert_not_called()
         self.assertIn("cookie_domain: configured", stdout.getvalue())
         self.assertIn("Chrome cookie reader: error", stdout.getvalue())
 
@@ -280,8 +514,8 @@ class DownloadTest(unittest.TestCase):
         ):
             self.assertEqual(main(["batch", str(source), "--library-id", "cli", "--cookie-domain", "cli.invalid", "--output-dir", str(output), "--delay", "0"]), 1)
         self.assertEqual(fetched.call_args_list, [
-            mock.call("10.1234/first", "cli", "cli.invalid", str(output)),
-            mock.call("10.1234/second", "cli", "cli.invalid", str(output)),
+            mock.call("10.1234/first", "cli", "cli.invalid", str(output), browser="chrome", profile=None),
+            mock.call("10.1234/second", "cli", "cli.invalid", str(output), browser="chrome", profile=None),
         ])
         sleep.assert_called_once_with(0.0)
         self.assertLess(stdout.getvalue().index("DOI: 10.1234/first"), stdout.getvalue().index("DOI: 10.1234/second"))
@@ -312,6 +546,31 @@ class DownloadTest(unittest.TestCase):
                 self.assertNotIn("secret.example", stdout.getvalue())
                 self.assertIn(f"failure ({stop_category})", stdout.getvalue())
                 self.assertIn(f"Summary: downloaded=0 skipped_existing=0 failed=4 stopped={stop_category}", stdout.getvalue())
+
+    def test_batch_stops_immediately_on_cookie_access_failure(self):
+        source = self.directory / "dois.txt"
+        source.write_text("10.1234/first\n10.1234/second\n", encoding="utf-8")
+        for category in ("cookie_timeout", "cookie_denied", "cookie_error", "cookie_config"):
+            with self.subTest(category=category):
+                stdout = io.StringIO()
+                with (
+                    mock.patch.dict(os.environ, {
+                        "LKFETCH_LIBRARY_ID": "lib", "LKFETCH_COOKIE_DOMAIN": "example.invalid",
+                        "LKFETCH_BROWSER": "dia", "LKFETCH_BROWSER_PROFILE": "Profile 2",
+                    }, clear=True),
+                    mock.patch("lkfetch.cli.download_pdf", side_effect=DownloadError(category, "/private/secret Cookie=PRIVATE")) as fetched,
+                    mock.patch("lkfetch.cli.time.sleep") as sleep,
+                    redirect_stdout(stdout),
+                ):
+                    self.assertEqual(main(["batch", str(source)]), 1)
+                fetched.assert_called_once_with("10.1234/first", "lib", "example.invalid", ".", browser="dia", profile="Profile 2")
+                sleep.assert_not_called()
+                self.assertNotIn("10.1234/second", stdout.getvalue())
+                self.assertNotIn("PRIVATE", stdout.getvalue())
+                self.assertIn(f"stopped={category}", stdout.getvalue())
+                self.assertIn("Status: failure (" + category + ": ", stdout.getvalue())
+                if category == "cookie_config":
+                    self.assertIn("--profile", stdout.getvalue())
 
     def test_batch_missing_config_and_invalid_delay(self):
         source = self.directory / "dois.txt"

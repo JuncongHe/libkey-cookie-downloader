@@ -1,6 +1,6 @@
 # lkfetch
 
-Unofficial LibKey PDF downloader for single DOIs or a sequential DOI file. Requires Python 3.11+ and an authorized Chrome or Dia session.
+Unofficial LibKey PDF downloader for single DOIs or a sequential DOI file, with a proxy login browser trigger. Requires Python 3.11+ and an authorized Chrome or Dia session for downloads.
 
 ```sh
 python3 -m venv .venv
@@ -22,9 +22,12 @@ Chrome is the default. To use Dia, select it and optionally name a Dia profile:
 lkfetch doctor --browser dia --profile "Profile 1"
 lkfetch download '10.1234/example' --browser dia --profile "Profile 1" --output-dir ./pdfs
 lkfetch batch dois.txt --browser dia --profile "Profile 1" --output-dir ./pdfs
+lkfetch login '10.1234/example' --browser dia --profile "Profile 1"
 ```
 
-All three commands accept `--browser chrome|dia` and `--profile NAME`. The environment equivalents are `LKFETCH_BROWSER` and `LKFETCH_BROWSER_PROFILE`; command-line values override them. Dia accepts `Default` or `Profile N`; replace the example profile with the exact local profile that contains the authenticated session. Without `--profile`, Dia selects the unique profile with cookies for the requested domain; if several match, specify one with `--profile`. Chrome profile selection is unsupported, so omit `--profile` with Chrome. The library ID and authenticated cookie domain are user- and institution-specific; provide them through options or environment variables rather than committing them.
+All four commands accept `--browser chrome|dia` and `--profile NAME`. The environment equivalents are `LKFETCH_BROWSER` and `LKFETCH_BROWSER_PROFILE`; command-line values override them. Dia accepts `Default` or `Profile N`; replace the example profile with the exact local profile that contains the authenticated session. Without `--profile`, `doctor`, `download`, and `batch` select the unique Dia profile with cookies for the requested domain; if several match, specify one with `--profile`. `login` opens Dia without selecting a cookie-matched profile. Chrome profile selection is unsupported, so omit `--profile` with Chrome. The library ID and authenticated cookie domain are user- and institution-specific; provide them through options or environment variables rather than committing them.
+
+`lkfetch login DOI --cookie-domain DOMAIN` opens the configured library proxy login page for that DOI; it needs a cookie domain but no library ID and does not download or inspect cookies. On macOS it opens Dia or Google Chrome by app name; elsewhere it uses the system browser. For a specific Dia profile, pass `--profile "Profile N"`. The command prints only the normalized DOI and a fixed status, never the browser URL. If a download ends at the configured proxy login page, `download` opens it once and still reports `proxy_login`; `batch` opens only the first such page and continues processing later DOIs. Sign in through the browser and retry the failed DOI after authentication.
 
 `python -m lkfetch download ...` works too. The command uses the selected browser session to request a temporary LibKey API token, resolves the DOI through the Third Iron articles API, and downloads its `fullTextFile` URL. Each request waits up to 60 seconds; only responses identified as PDFs are saved. Existing files are skipped. Status categories distinguish HTTP 401/403 (`authentication_error`), a final proxy login HTML page (`proxy_login`), unusable token data (`api_token_error`), article API 404 (`article_not_found`), invalid article data or PDF URL (`article_error`), downstream non-PDF content (`non_pdf`), HTTP 429 (`rate_limited`), and other HTTP failures (`http_error`). Use it only for content your account is licensed to access, and respect provider rate limits.
 

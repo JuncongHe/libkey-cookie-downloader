@@ -63,7 +63,18 @@ def load_chrome_cookies(cookie_domain: str, *, cookie_loader=None):
 
 
 def valid_cookie_domain(value: str) -> bool:
-    return re.fullmatch(r"\.?[A-Za-z0-9][A-Za-z0-9.-]*", value) is not None
+    label = r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+    return len(value) <= 254 and re.fullmatch(rf"\.?{label}(?:\.{label})*", value) is not None
+
+
+def proxy_login_url(doi: str, cookie_domain: str) -> str:
+    """Build an institution login URL containing only the DOI target."""
+    doi = normalize_doi(doi)
+    domain = cookie_domain.strip()
+    if not valid_cookie_domain(domain):
+        raise DownloadError("invalid_input", "enter a valid cookie domain")
+    query = urllib.parse.urlencode({"url": f"https://doi.org/{doi}"})
+    return f"https://login.{domain.lstrip('.')}/login?{query}"
 
 
 def _is_resolver_host(host: str) -> bool:

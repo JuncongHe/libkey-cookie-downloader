@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from lkfetch.cli import main
 from lkfetch import browser as browser_module
 from lkfetch.browser import BrowserError
-from lkfetch.download import DownloadError, _ProxyRedirectHandler, download_pdf, normalize_doi, target_for
+from lkfetch.download import DownloadError, _ProxyRedirectHandler, download_pdf, normalize_doi, proxy_login_url, target_for
 
 
 class FakeResponse(io.BytesIO):
@@ -367,6 +367,95 @@ class DownloadTest(unittest.TestCase):
         with self.assertRaises(DownloadError):
             download_pdf("10.1234/example", "lib_1", ".", self.directory, cookie_loader=self.loader)
 
+    def test_proxy_login_url_contains_only_encoded_doi_target(self):
+        url = proxy_login_url(" doi:10.1234/Example ", ".proxy.example.edu")
+        parsed = urllib.parse.urlsplit(url)
+        self.assertEqual((parsed.scheme, parsed.netloc, parsed.path), ("https", "login.proxy.example.edu", "/login"))
+        self.assertEqual(urllib.parse.parse_qs(parsed.query), {"url": ["https://doi.org/10.1234/Example"]})
+        self.assertNotIn("access_token", url)
+        for domain in ("", "..example.edu", "example..edu", "-example.edu", "example.edu/"):
+            with self.subTest(domain=domain), self.assertRaises(DownloadError) as caught:
+                proxy_login_url("10.1234/example", domain)
+            self.assertEqual(caught.exception.category, "invalid_input")
+
+    def test_explicit_login_opens_selected_mac_app_without_network(self):
+        for browser, profile, app in (("chrome", None, "Google Chrome"), ("dia", None, "Dia"), ("dia", "Profile 2", "Dia")):
+            with self.subTest(browser=browser, profile=profile):
+                stdout = io.StringIO()
+                with (
+                    mock.patch.dict(os.environ, {}, clear=True),
+                    mock.patch("lkfetch.cli.sys.platform", "darwin"),
+                    mock.patch("lkfetch.cli.subprocess.run") as opened,
+                    mock.patch("lkfetch.cli.download_pdf") as fetched,
+                    mock.patch("lkfetch.cli.webbrowser.open") as fallback,
+                    redirect_stdout(stdout),
+                ):
+                    options = ["--browser", browser] + (["--profile", profile] if profile else [])
+                    self.assertEqual(main(["login", "doi:10.1234/example", "--cookie-domain", "example.invalid", *options]), 0)
+                command = opened.call_args.args[0]
+                self.assertEqual(command[:3], ["open", "-a", app])
+                self.assertEqual(command[3], proxy_login_url("10.1234/example", "example.invalid"))
+                if profile:
+                    self.assertEqual(command[4:6], ["--args", "--profile-directory=Profile 2"])
+                self.assertEqual(opened.call_args.kwargs["stdout"], subprocess.DEVNULL)
+                self.assertEqual(opened.call_args.kwargs["stderr"], subprocess.DEVNULL)
+                fetched.assert_not_called()
+                fallback.assert_not_called()
+                self.assertEqual(stdout.getvalue(), "DOI: 10.1234/example\nStatus: opened\n")
+
+    def test_explicit_login_validation_and_fixed_open_failure(self):
+        for options, environment, category in (
+            (["login", "invalid"], {}, "invalid_input"),
+            (["login", "10.1234/example"], {}, "missing_config"),
+            (["login", "10.1234/example", "--cookie-domain", "bad..invalid"], {}, "invalid_input"),
+            (["login", "10.1234/example", "--cookie-domain", "example.invalid", "--profile", "Default"], {}, "cookie_config"),
+            (["login", "10.1234/example", "--cookie-domain", "example.invalid", "--browser", "dia", "--profile", "/private/SECRET"], {}, "cookie_config"),
+        ):
+            with self.subTest(category=category, options=options):
+                stderr = io.StringIO()
+                with mock.patch.dict(os.environ, environment, clear=True), mock.patch("lkfetch.cli.subprocess.run") as opened, mock.patch("lkfetch.cli.webbrowser.open") as fallback, redirect_stderr(stderr):
+                    self.assertEqual(main(options), 2)
+                opened.assert_not_called()
+                fallback.assert_not_called()
+                self.assertIn(f"failure ({category}:", stderr.getvalue())
+                self.assertNotIn("SECRET", stderr.getvalue())
+
+        stderr = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("lkfetch.cli.sys.platform", "darwin"),
+            mock.patch("lkfetch.cli.subprocess.run", side_effect=subprocess.CalledProcessError(1, "open", output="SECRET")),
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(main(["login", "10.1234/example", "--cookie-domain", "example.invalid"]), 1)
+        self.assertIn("failure (browser_open_error: could not open the selected browser)", stderr.getvalue())
+        self.assertNotIn("SECRET", stderr.getvalue())
+        self.assertNotIn("https://", stderr.getvalue())
+
+    def test_explicit_login_uses_stdlib_fallback_off_mac(self):
+        stdout = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {"LKFETCH_COOKIE_DOMAIN": "env.invalid", "LKFETCH_BROWSER": "dia"}, clear=True),
+            mock.patch("lkfetch.cli.sys.platform", "linux"),
+            mock.patch("lkfetch.cli.webbrowser.open", return_value=True) as opened,
+            mock.patch("lkfetch.cli.subprocess.run") as native,
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(main(["login", "10.1234/example", "--cookie-domain", "cli.invalid"]), 0)
+        opened.assert_called_once_with(proxy_login_url("10.1234/example", "cli.invalid"), new=2)
+        native.assert_not_called()
+        self.assertIn("Status: opened", stdout.getvalue())
+
+        stderr = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {"LKFETCH_COOKIE_DOMAIN": "example.invalid"}, clear=True),
+            mock.patch("lkfetch.cli.sys.platform", "linux"),
+            mock.patch("lkfetch.cli.webbrowser.open", return_value=False),
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(main(["login", "10.1234/example"]), 1)
+        self.assertIn("failure (browser_open_error:", stderr.getvalue())
+
     def test_http_errors_are_sanitized_and_stage_specific(self):
         for stage in ("api-tokens", "articles", "article.pdf"):
             for code, category in ((401, "authentication_error"), (403, "authentication_error"),
@@ -484,13 +573,28 @@ class DownloadTest(unittest.TestCase):
                 with (
                     mock.patch.dict(os.environ, {}, clear=True),
                     mock.patch("lkfetch.cli.download_pdf", side_effect=DownloadError(category, "https://secret.example/?token=PRIVATE")),
+                    mock.patch("lkfetch.cli._open_proxy_login") as opened,
                     redirect_stderr(stderr),
                 ):
                     self.assertEqual(main(["download", "10.1234/example", "--library-id", "lib", "--cookie-domain", "example.invalid"]), 1)
+                self.assertEqual(opened.call_count, 1 if category == "proxy_login" else 0)
                 self.assertIn(f"failure ({category}:", stderr.getvalue())
                 self.assertIn(hint, stderr.getvalue())
                 self.assertNotIn("secret.example", stderr.getvalue())
                 self.assertNotIn("PRIVATE", stderr.getvalue())
+
+    def test_single_proxy_login_keeps_original_failure_if_open_fails(self):
+        stderr = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("lkfetch.cli.download_pdf", side_effect=DownloadError("proxy_login", "SECRET")),
+            mock.patch("lkfetch.cli._open_proxy_login", side_effect=DownloadError("browser_open_error", "SECRET")) as opened,
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(main(["download", "10.1234/example", "--library-id", "lib", "--cookie-domain", "example.invalid"]), 1)
+        opened.assert_called_once_with("10.1234/example", "example.invalid", "chrome", None)
+        self.assertIn("failure (proxy_login: proxy login required; sign in through your library and retry)", stderr.getvalue())
+        self.assertNotIn("SECRET", stderr.getvalue())
 
     def test_doctor_ready_scopes_chrome_and_redacts_values(self):
         stdout = io.StringIO()
@@ -814,11 +918,13 @@ class DownloadTest(unittest.TestCase):
         with (
             mock.patch.dict(os.environ, {"LKFETCH_LIBRARY_ID": "lib", "LKFETCH_COOKIE_DOMAIN": "example.invalid"}, clear=True),
             mock.patch("lkfetch.cli.download_pdf", side_effect=errors + [ninth]) as fetched,
+            mock.patch("lkfetch.cli._open_proxy_login") as opened,
             mock.patch("lkfetch.cli.time.sleep") as sleep,
             redirect_stdout(stdout),
         ):
             self.assertEqual(main(["batch", str(source)]), 1)
         self.assertEqual(fetched.call_count, 9)
+        opened.assert_called_once_with("10.1234/item4", "example.invalid", "chrome", None)
         self.assertEqual(sleep.call_args_list, [mock.call(3.0)] * 8)
         self.assertIn("item8", stdout.getvalue())
         self.assertNotIn("secret.example", stdout.getvalue())
@@ -827,6 +933,28 @@ class DownloadTest(unittest.TestCase):
             self.assertIn(f"failure ({category})", stdout.getvalue())
         self.assertIn("Status: downloaded", stdout.getvalue())
         self.assertIn("Summary: downloaded=1 skipped_existing=0 failed=8", stdout.getvalue())
+
+    def test_batch_opens_first_proxy_login_only_and_continues(self):
+        source = self.directory / "dois.txt"
+        source.write_text("10.1234/first\n10.1234/second\n10.1234/third\n", encoding="utf-8")
+        third = (target_for("10.1234/third", self.directory), "downloaded")
+        stdout = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {"LKFETCH_LIBRARY_ID": "lib", "LKFETCH_COOKIE_DOMAIN": "example.invalid"}, clear=True),
+            mock.patch("lkfetch.cli.download_pdf", side_effect=[
+                DownloadError("proxy_login", "SECRET"), DownloadError("proxy_login", "SECRET"), third,
+            ]) as fetched,
+            mock.patch("lkfetch.cli._open_proxy_login", side_effect=OSError("SECRET")) as opened,
+            mock.patch("lkfetch.cli.time.sleep"),
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(main(["batch", str(source)]), 1)
+        self.assertEqual(fetched.call_count, 3)
+        opened.assert_called_once_with("10.1234/first", "example.invalid", "chrome", None)
+        self.assertEqual(stdout.getvalue().count("failure (proxy_login)"), 2)
+        self.assertIn("Status: downloaded", stdout.getvalue())
+        self.assertIn("Summary: downloaded=1 skipped_existing=0 failed=2", stdout.getvalue())
+        self.assertNotIn("SECRET", stdout.getvalue())
 
     def test_batch_stops_on_rate_limit(self):
         source = self.directory / "dois.txt"

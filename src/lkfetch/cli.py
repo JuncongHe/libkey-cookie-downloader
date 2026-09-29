@@ -4,11 +4,13 @@ import argparse
 import math
 import os
 import re
+import subprocess
 import sys
 import time
+import webbrowser
 
 from .browser import BrowserError, load_browser_cookies
-from .download import DownloadError, chrome_cookie_loader, download_pdf, normalize_doi, target_for, valid_cookie_domain
+from .download import DownloadError, chrome_cookie_loader, download_pdf, normalize_doi, proxy_login_url, target_for, valid_cookie_domain
 
 
 _ERROR_MESSAGES = {
@@ -21,6 +23,7 @@ _ERROR_MESSAGES = {
     "file_error": "could not save PDF",
     "authentication_error": "browser session was not authorized",
     "proxy_login": "proxy login required; sign in through your library and retry",
+    "browser_open_error": "could not open the selected browser",
     "api_token_error": "service did not provide a usable API token",
     "article_not_found": "article was not found",
     "article_error": "service did not provide a valid article PDF URL",
@@ -54,6 +57,47 @@ def _profile_name(value: str | None, missing: str) -> str:
     return value if re.fullmatch(r"Default|Profile [0-9]+", value) else "invalid"
 
 
+def _open_proxy_login(doi: str, cookie_domain: str, browser: str, profile: str | None) -> None:
+    if browser not in {"chrome", "dia"} or (browser == "chrome" and profile is not None):
+        raise DownloadError("cookie_config", _ERROR_MESSAGES["cookie_config"])
+    if browser == "dia" and _profile_name(profile, "auto") == "invalid":
+        raise DownloadError("cookie_config", _ERROR_MESSAGES["cookie_config"])
+    url = proxy_login_url(doi, cookie_domain)
+    try:
+        if sys.platform == "darwin":
+            command = ["open", "-a", "Dia" if browser == "dia" else "Google Chrome", url]
+            if browser == "dia" and profile is not None:
+                command.extend(["--args", f"--profile-directory={profile}"])
+            subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        elif not webbrowser.open(url, new=2):
+            raise DownloadError("browser_open_error", _ERROR_MESSAGES["browser_open_error"])
+    except DownloadError:
+        raise
+    except Exception:
+        raise DownloadError("browser_open_error", _ERROR_MESSAGES["browser_open_error"]) from None
+
+
+def _login(args: argparse.Namespace) -> int:
+    try:
+        doi = normalize_doi(args.doi)
+    except DownloadError:
+        print("DOI: invalid\nStatus: failure (invalid_input: check the DOI)", file=sys.stderr)
+        return 2
+    cookie_domain = args.cookie_domain if args.cookie_domain is not None else os.getenv("LKFETCH_COOKIE_DOMAIN")
+    if not cookie_domain or not cookie_domain.strip():
+        print(f"DOI: {doi}\nStatus: failure (missing_config: set --cookie-domain or LKFETCH_COOKIE_DOMAIN)", file=sys.stderr)
+        return 2
+    browser, profile = _browser_options(args)
+    try:
+        _open_proxy_login(doi, cookie_domain, browser, profile)
+    except DownloadError as error:
+        category = error.category if error.category in {"invalid_input", "cookie_config", "browser_open_error"} else "browser_open_error"
+        print(f"DOI: {doi}\nStatus: failure ({category}: {_ERROR_MESSAGES[category]})", file=sys.stderr)
+        return 2 if category in {"invalid_input", "cookie_config"} else 1
+    print(f"DOI: {doi}\nStatus: opened")
+    return 0
+
+
 def _batch(args: argparse.Namespace) -> int:
     library_id = args.library_id if args.library_id is not None else os.getenv("LKFETCH_LIBRARY_ID")
     cookie_domain = args.cookie_domain if args.cookie_domain is not None else os.getenv("LKFETCH_COOKIE_DOMAIN")
@@ -68,6 +112,7 @@ def _batch(args: argparse.Namespace) -> int:
     downloaded = skipped = failed = 0
     stopped = None
     attempted = False
+    login_open_attempted = False
     try:
         with open(args.doi_file, encoding="utf-8") as lines:
             for line in lines:
@@ -102,6 +147,12 @@ def _batch(args: argparse.Namespace) -> int:
                     print(f"DOI: {doi}\nPath: {target}\nStatus: {status}")
                 else:
                     failed += 1
+                    if category == "proxy_login" and not login_open_attempted:
+                        login_open_attempted = True
+                        try:
+                            _open_proxy_login(doi, cookie_domain, browser, profile)
+                        except Exception:
+                            pass
                     hint = f": {_ERROR_MESSAGES[category]}" if category in _COOKIE_ERRORS else ""
                     print(f"DOI: {doi}\nPath: {target}\nStatus: failure ({category}{hint})")
                     if category == "rate_limited" or category in _COOKIE_ERRORS:
@@ -162,6 +213,11 @@ def main(argv: list[str] | None = None) -> int:
     download.add_argument("--output-dir", default=".", metavar="DIR")
     download.add_argument("--browser", choices=("chrome", "dia"))
     download.add_argument("--profile", metavar="NAME")
+    login = commands.add_parser("login", help="open the library proxy login for one DOI")
+    login.add_argument("doi", metavar="DOI")
+    login.add_argument("--cookie-domain", metavar="DOMAIN")
+    login.add_argument("--browser", choices=("chrome", "dia"))
+    login.add_argument("--profile", metavar="NAME")
     batch = commands.add_parser("batch", help="download DOI PDFs sequentially from a UTF-8 file")
     batch.add_argument("doi_file", metavar="DOI_FILE")
     batch.add_argument("--library-id", metavar="ID")
@@ -180,6 +236,8 @@ def main(argv: list[str] | None = None) -> int:
         return _batch(args)
     if args.command == "doctor":
         return _doctor(args)
+    if args.command == "login":
+        return _login(args)
 
     try:
         doi = normalize_doi(args.doi)
@@ -201,6 +259,11 @@ def main(argv: list[str] | None = None) -> int:
         target, status = download_pdf(doi, library_id, cookie_domain, args.output_dir, browser=browser, profile=profile)
     except DownloadError as error:
         category = error.category if error.category in _ERROR_MESSAGES else "download_error"
+        if category == "proxy_login":
+            try:
+                _open_proxy_login(doi, cookie_domain, browser, profile)
+            except Exception:
+                pass
         print(f"DOI: {doi}\nPath: {target}\nStatus: failure ({category}: {_ERROR_MESSAGES[category]})", file=sys.stderr)
         return 1
     except OSError:

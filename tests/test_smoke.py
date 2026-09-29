@@ -14,3 +14,4 @@ class SmokeTest(unittest.TestCase):
             check=True,
         )
         self.assertIn("download", result.stdout)
+        self.assertIn("login", result.stdout)

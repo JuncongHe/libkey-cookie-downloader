@@ -135,10 +135,21 @@ def _pdf_link_from_html(body: bytes, base_url: str, cookie_domain: str) -> str |
     return min(candidates)[1]
 
 
+def _is_proxy_login_url(url: str, cookie_domain: str) -> bool:
+    parsed = urllib.parse.urlsplit(url)
+    return (
+        parsed.scheme == "https"
+        and (parsed.hostname or "").lower() == f"login.{cookie_domain.lstrip('.').lower()}"
+        and parsed.path == "/login"
+    )
+
+
 def _save_pdf_response(response, directory: Path, cookie_domain: str) -> tuple[Path | None, str | None]:
     first = response.read(1024)
     content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
     if not first.startswith(b"%PDF-") and content_type != "application/pdf":
+        if content_type == "text/html" and _is_proxy_login_url(response.geturl(), cookie_domain):
+            raise DownloadError("proxy_login", "proxy login required; sign in through your library and retry")
         if content_type != "text/html":
             raise DownloadError("non_pdf", "server returned a non-PDF response")
         body = first + response.read(max(0, 2_000_000 - len(first)))
@@ -239,10 +250,10 @@ def download_pdf(
         try:
             with opener.open(token_request, timeout=60) as response:
                 token = json.load(response)["api-tokens"][0]["id"]
-            if not isinstance(token, str) or not token or any(ord(char) < 32 for char in token):
+            if not isinstance(token, str) or not token or any(not 0x21 <= ord(char) <= 0x7E for char in token):
                 raise ValueError
         except (ValueError, KeyError, IndexError, TypeError):
-            raise DownloadError("authentication_error", "browser session was not authorized") from None
+            raise DownloadError("api_token_error", "service did not provide a usable API token") from None
 
         article_request = urllib.request.Request(
             f"https://api.thirdiron.com/v2/articles/{urllib.parse.quote('doi:' + doi, safe='')}?include=issue,journal",
@@ -252,8 +263,13 @@ def download_pdf(
             with opener.open(article_request, timeout=60) as response:
                 attributes = json.load(response)["data"]["attributes"]
                 pdf_url = attributes.get("fullTextFile")
+        except urllib.error.HTTPError as error:
+            if error.code != 404:
+                raise
+            error.close()
+            raise DownloadError("article_not_found", "article was not found") from None
         except (ValueError, KeyError, TypeError, AttributeError):
-            raise DownloadError("non_pdf", "service did not provide a PDF URL") from None
+            raise DownloadError("article_error", "service did not provide a valid article PDF URL") from None
         try:
             if not isinstance(pdf_url, str):
                 raise ValueError
@@ -261,7 +277,7 @@ def download_pdf(
                 raise ValueError
             pdf_request = urllib.request.Request(_libkey_resolver_url(pdf_url, token))
         except (TypeError, ValueError):
-            raise DownloadError("non_pdf", "service did not provide a PDF URL")
+            raise DownloadError("article_error", "service did not provide a valid article PDF URL") from None
 
         candidates = [pdf_request.full_url]
         permalink = attributes.get("permalink")
